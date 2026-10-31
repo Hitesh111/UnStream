@@ -75,5 +75,22 @@ def test_dashboard_endpoints(config: Config, db: Database) -> None:
 
     assert client.get("/", headers=headers).status_code == 200
 
+    # Downloaded files endpoint
+    dl_res = client.get("/api/downloaded-files", headers=headers)
+    assert dl_res.status_code == 200
+    assert "files" in dl_res.json()
+    assert "total_bytes" in dl_res.json()
+
+    # Export playlists endpoint
+    exp_res = client.post("/api/actions/export-playlists", headers=headers)
+    assert exp_res.status_code == 200
+    assert exp_res.json()["ok"] is True
+
+    # Batch playlist actions
+    batch_res = client.post("/api/actions/download-playlists-batch?playlist_ids=1,2", headers=headers)
+    assert batch_res.status_code == 200
+    assert batch_res.json()["ok"] is True
+
     blocked = client.get("/api/health", headers={"host": "evil.example"})
     assert blocked.status_code == 403
+

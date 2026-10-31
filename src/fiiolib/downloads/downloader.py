@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 from fiiolib.activity import activity
+from fiiolib.audio.device_profile import sanitize_component
 from fiiolib.config import Config
 from fiiolib.db import Database, repo
 from fiiolib.library.organiser import Organiser
@@ -252,6 +254,15 @@ def download_playlist(
         else:
             errors.append(f"Track {tid} ({row['title']}): {res.get('error')}")
 
+    # Generate/update the .m3u8 playlist file for Echo Mini
+    m3u_path = export_playlist_m3u(config, db, playlist_id)
+    if m3u_path:
+        activity.log(
+            level="info",
+            category="playlist",
+            message=f"Exported M3U8 playlist for Echo Mini: '{m3u_path.name}'",
+        )
+
     activity.finish_operation(
         summary=f"Playlist #{playlist_id} finished: {downloaded} downloaded, {skipped} skipped, {len(errors)} failed"
     )
@@ -262,7 +273,155 @@ def download_playlist(
         "downloaded": downloaded,
         "skipped": skipped,
         "errors": errors,
+        "m3u_path": str(m3u_path) if m3u_path else None,
     }
+
+
+def export_playlist_m3u(
+    config: Config, db: Database, playlist_id: int, target_dir: Path | None = None
+) -> Path | None:
+    """Generate an Echo Mini compliant UTF-8 .m3u8 playlist file."""
+    pl_row = db.one("SELECT id, name FROM playlists WHERE id = ?", (playlist_id,))
+    if not pl_row:
+        return None
+    raw_name = pl_row["name"]
+    name = sanitize_component(raw_name)
+    if not target_dir:
+        target_dir = config.root / "playlists"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    m3u_path = target_dir / f"{name}.m3u8"
+
+    tracks = db.query(
+        "SELECT t.title, a.name AS artist_name, t.duration_ms, f.path "
+        "FROM playlist_tracks pt "
+        "JOIN tracks t ON t.id = pt.track_id "
+        "JOIN artists a ON a.id = t.artist_id "
+        "LEFT JOIN files f ON f.track_id = t.id AND f.validated = 1 "
+        "WHERE pt.playlist_id = ? "
+        "ORDER BY pt.position ASC",
+        (playlist_id,),
+    )
+    lines = ["#EXTM3U", f"#PLAYLIST:{raw_name}"]
+    matched = 0
+    music_dir = config.music_dir.resolve()
+    for t in tracks:
+        file_path_str = t["path"]
+        if not file_path_str:
+            continue
+        fp = Path(file_path_str)
+        if not fp.exists():
+            continue
+        dur_sec = (t["duration_ms"] or 0) // 1000
+        lines.append(f"#EXTINF:{dur_sec},{t['artist_name']} - {t['title']}")
+        try:
+            rel_within_music = fp.resolve().relative_to(music_dir)
+            lines.append(f"../Music/{rel_within_music.as_posix()}")
+        except ValueError:
+            try:
+                rel = os.path.relpath(file_path_str, target_dir)
+                lines.append(rel)
+            except ValueError:
+                lines.append(file_path_str)
+        matched += 1
+
+    if matched == 0:
+        # Don't create empty playlist files
+        return None
+
+    m3u_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return m3u_path
+
+
+def export_all_playlists(config: Config, db: Database, target_dir: Path | None = None) -> list[str]:
+    """Export all playlists that contain at least one downloaded audio track."""
+    rows = db.query("SELECT DISTINCT playlist_id FROM playlist_tracks")
+    exported = []
+    for r in rows:
+        path = export_playlist_m3u(config, db, int(r["playlist_id"]), target_dir=target_dir)
+        if path:
+            exported.append(str(path))
+    return exported
+
+
+def download_playlists_batch(
+    config: Config, db: Database, playlist_ids: list[int], max_tracks_per_playlist: int = 50
+) -> dict[str, Any]:
+    """Download multiple selected playlists sequentially with live progress and M3U export."""
+    total_pls = len(playlist_ids)
+    activity.start_operation(
+        action="download",
+        description=f"Batch downloading {total_pls} playlists",
+        total=total_pls,
+    )
+    activity.log(
+        level="info",
+        category="playlist",
+        message=f"Starting batch acquisition of {total_pls} playlists…",
+    )
+
+    total_downloaded = 0
+    total_skipped = 0
+    all_errors = []
+    playlist_summaries = []
+
+    for idx, pid in enumerate(playlist_ids, 1):
+        pl_row = db.one("SELECT name FROM playlists WHERE id = ?", (pid,))
+        pl_name = pl_row["name"] if pl_row else f"Playlist #{pid}"
+        activity.update_progress(
+            current=idx,
+            total=total_pls,
+            current_item=f"Playlist ({idx}/{total_pls}): {pl_name}",
+        )
+        activity.log(
+            level="info",
+            category="playlist",
+            message=f"Processing playlist [{idx}/{total_pls}]: '{pl_name}'",
+        )
+        res = download_playlist(config, db, pid, max_tracks=max_tracks_per_playlist)
+        total_downloaded += res["downloaded"]
+        total_skipped += res["skipped"]
+        all_errors.extend(res["errors"])
+        playlist_summaries.append({
+            "playlist_id": pid,
+            "name": pl_name,
+            "downloaded": res["downloaded"],
+            "skipped": res["skipped"],
+            "errors": len(res["errors"]),
+        })
+
+    activity.finish_operation(
+        summary=f"Batch complete ({total_pls} playlists): {total_downloaded} tracks downloaded, {total_skipped} skipped, {len(all_errors)} failed"
+    )
+    activity.log(
+        level="success",
+        category="playlist",
+        message=f"✓ Batch acquisition complete: {total_downloaded} tracks downloaded across {total_pls} playlists.",
+    )
+    return {
+        "ok": True,
+        "playlists_count": total_pls,
+        "downloaded": total_downloaded,
+        "skipped": total_skipped,
+        "errors": all_errors,
+        "summaries": playlist_summaries,
+    }
+
+
+def download_all_playlists(
+    config: Config, db: Database, max_tracks_per_playlist: int = 50
+) -> dict[str, Any]:
+    """Download all playlists that have indexed tracks in database."""
+    rows = db.query(
+        "SELECT p.id FROM playlists p "
+        "JOIN playlist_tracks pt ON pt.playlist_id = p.id "
+        "GROUP BY p.id "
+        "HAVING COUNT(pt.track_id) > 0 "
+        "ORDER BY (CASE WHEN p.owner_name = 'Hitesh' THEN 0 ELSE 1 END), p.name ASC"
+    )
+    pids = [int(r["id"]) for r in rows]
+    if not pids:
+        return {"ok": True, "count": 0, "downloaded": 0, "skipped": 0, "errors": []}
+    return download_playlists_batch(config, db, pids, max_tracks_per_playlist=max_tracks_per_playlist)
 
 
 def download_saved_tracks(config: Config, db: Database, limit: int = 25) -> dict[str, Any]:

@@ -363,6 +363,20 @@ class SyncPlanner:
 
         if not dry_run and not result["errors"]:
             result["albums_synced"] = self._mark_albums_synced(plan)
+            # Sync M3U8 playlists to microSD card
+            try:
+                from fiiolib.downloads.downloader import export_all_playlists
+                card_playlists = plan.device.mount_point / "Playlists"
+                exported = export_all_playlists(self.config, self.db, target_dir=card_playlists)
+                if exported:
+                    activity.log(
+                        level="info",
+                        category="playlist",
+                        message=f"Exported {len(exported)} M3U8 playlists to card Playlists/ directory.",
+                    )
+            except Exception as exc:
+                logger.warning("Could not export card playlists: %s", exc)
+
             # macOS automatically creates AppleDouble ._* files on FAT/exFAT volumes,
             # which confuse the Echo Mini display. Clean them automatically after sync.
             if sys.platform == "darwin" and shutil.which("dot_clean"):
@@ -372,14 +386,15 @@ class SyncPlanner:
                     message="Running macOS dot_clean to merge AppleDouble resource fork files…",
                 )
                 try:
-                    music_dir = plan.device.mount_point / "Music"
-                    if music_dir.exists():
-                        subprocess.run(
-                            ["dot_clean", "-m", str(music_dir)],
-                            capture_output=True,
-                            check=False,
-                            timeout=30,
-                        )
+                    for folder in ("Music", "Playlists"):
+                        target_path = plan.device.mount_point / folder
+                        if target_path.exists():
+                            subprocess.run(
+                                ["dot_clean", "-m", str(target_path)],
+                                capture_output=True,
+                                check=False,
+                                timeout=30,
+                            )
                 except Exception:
                     pass
 

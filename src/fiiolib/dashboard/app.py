@@ -118,21 +118,30 @@ def create_app(config: Config, db: Database) -> FastAPI:
     def list_playlists(
         q: str = Query(default=""),
         only_with_tracks: bool = Query(default=False),
+        only_downloaded: bool = Query(default=False),
     ) -> dict[str, Any]:
         query = q.strip()
         sql = (
             "SELECT p.id, p.spotify_id, p.name, p.owner_name, p.description, p.total_tracks, "
-            "p.public, p.collaborative, p.kind, COUNT(pt.track_id) AS indexed_tracks "
+            "p.public, p.collaborative, p.kind, "
+            "COUNT(DISTINCT pt.track_id) AS indexed_tracks, "
+            "COUNT(DISTINCT CASE WHEN f.id IS NOT NULL AND f.validated = 1 THEN pt.track_id END) AS downloaded_tracks "
             "FROM playlists p "
             "LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id "
+            "LEFT JOIN files f ON f.track_id = pt.track_id "
         )
         params: list[Any] = []
         if query:
             sql += "WHERE (p.name LIKE ? OR p.owner_name LIKE ?) "
             params.extend([f"%{query}%", f"%{query}%"])
         sql += "GROUP BY p.id "
+        having_clauses: list[str] = []
         if only_with_tracks:
-            sql += "HAVING indexed_tracks > 0 "
+            having_clauses.append("indexed_tracks > 0")
+        if only_downloaded:
+            having_clauses.append("downloaded_tracks > 0")
+        if having_clauses:
+            sql += "HAVING " + " AND ".join(having_clauses) + " "
         sql += "ORDER BY (CASE WHEN p.owner_name = 'Hitesh' THEN 0 ELSE 1 END), indexed_tracks DESC, p.name COLLATE NOCASE ASC"
         rows = [dict(row) for row in db.query(sql, tuple(params))]
         return {"count": len(rows), "playlists": rows}
@@ -167,6 +176,7 @@ def create_app(config: Config, db: Database) -> FastAPI:
     def list_songs(
         q: str = Query(default=""),
         category: str = Query(default="all"),
+        only_downloaded: bool = Query(default=False),
         page: int = Query(default=1, ge=1),
         page_size: int = Query(default=50, ge=1, le=200),
     ) -> dict[str, Any]:
@@ -183,7 +193,10 @@ def create_app(config: Config, db: Database) -> FastAPI:
 
         if category == "saved":
             join_clause += "JOIN spotify_saved_tracks st ON st.track_id = t.id "
-        elif category == "synced":
+        elif category in ("synced", "downloaded"):
+            conditions.append("f.validated = 1")
+
+        if only_downloaded:
             conditions.append("f.validated = 1")
 
         if query:
@@ -214,6 +227,33 @@ def create_app(config: Config, db: Database) -> FastAPI:
             "page_size": page_size,
             "total_pages": total_pages,
             "songs": rows,
+        }
+
+    @app.get("/api/downloaded-files")
+    def list_downloaded_files(q: str = Query(default="")) -> dict[str, Any]:
+        query = q.strip()
+        sql = (
+            "SELECT f.id, f.path, f.format, f.size_bytes, f.sha256, "
+            "t.id AS track_id, t.title, a.name AS artist_name, al.title AS album_title, "
+            "t.duration_ms, f.validated, f.mtime "
+            "FROM files f "
+            "JOIN tracks t ON t.id = f.track_id "
+            "JOIN artists a ON a.id = t.artist_id "
+            "JOIN albums al ON al.id = t.album_id "
+            "WHERE f.validated = 1 "
+        )
+        params: list[Any] = []
+        if query:
+            pattern = f"%{query}%"
+            sql += "AND (t.title LIKE ? OR a.name LIKE ? OR al.title LIKE ? OR f.path LIKE ?) "
+            params.extend([pattern, pattern, pattern, pattern])
+        sql += "ORDER BY a.name COLLATE NOCASE ASC, al.title COLLATE NOCASE ASC, t.track_number ASC"
+        rows = [dict(row) for row in db.query(sql, tuple(params))]
+        total_bytes = sum(int(r["size_bytes"] or 0) for r in rows)
+        return {
+            "count": len(rows),
+            "total_bytes": total_bytes,
+            "files": rows,
         }
 
     @app.get("/api/search")
@@ -383,6 +423,30 @@ def create_app(config: Config, db: Database) -> FastAPI:
         from fiiolib.downloads.downloader import download_playlist
         return download_playlist(config, db, playlist_id, max_tracks=max_tracks)
 
+    @app.post("/api/actions/download-playlists-batch")
+    def action_download_playlists_batch(
+        playlist_ids: str = Query(...),
+        max_tracks_per_playlist: int = Query(default=30),
+    ) -> dict[str, Any]:
+        from fiiolib.downloads.downloader import download_playlists_batch
+        pids = [int(x.strip()) for x in playlist_ids.split(",") if x.strip().isdigit()]
+        if not pids:
+            return {"ok": False, "error": "No valid playlist IDs provided"}
+        return download_playlists_batch(config, db, pids, max_tracks_per_playlist=max_tracks_per_playlist)
+
+    @app.post("/api/actions/download-all-playlists")
+    def action_download_all_playlists(
+        max_tracks_per_playlist: int = Query(default=30),
+    ) -> dict[str, Any]:
+        from fiiolib.downloads.downloader import download_all_playlists
+        return download_all_playlists(config, db, max_tracks_per_playlist=max_tracks_per_playlist)
+
+    @app.post("/api/actions/export-playlists")
+    def action_export_playlists() -> dict[str, Any]:
+        from fiiolib.downloads.downloader import export_all_playlists
+        exported = export_all_playlists(config, db)
+        return {"ok": True, "exported": len(exported), "playlists": exported}
+
     @app.post("/api/actions/download-saved")
     def action_download_saved(limit: int = Query(default=20)) -> dict[str, Any]:
         from fiiolib.downloads.downloader import download_saved_tracks
@@ -460,6 +524,7 @@ def _status(config: Config, db: Database) -> dict[str, Any]:
         "acquisitions": int(db.scalar("SELECT COUNT(*) FROM acquisitions") or 0),
         "sync_runs": int(db.scalar("SELECT COUNT(*) FROM sync_runs") or 0),
         "files": int(db.scalar("SELECT COUNT(*) FROM files") or 0),
+        "downloaded_files": int(db.scalar("SELECT COUNT(*) FROM files WHERE validated = 1") or 0),
         "playlists": int(db.scalar("SELECT COUNT(*) FROM playlists") or 0),
         "saved_tracks": int(db.scalar("SELECT COUNT(*) FROM spotify_saved_tracks") or 0),
         "tracks": int(db.scalar("SELECT COUNT(*) FROM tracks") or 0),
@@ -912,7 +977,7 @@ input[type="checkbox"] { cursor: pointer; }
     </div>
   </section>
 
-  <!-- Spotify Library Browser (Playlists & Songs) -->
+  <!-- Spotify Library Browser (Playlists & Songs & Downloaded Local) -->
   <section class="full-width" id="spotify-browser-section">
     <div class="sec-head">
       <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap;">
@@ -921,35 +986,49 @@ input[type="checkbox"] { cursor: pointer; }
           <button class="tab-btn active" id="tab-btn-playlists" onclick="switchBrowserTab('playlists')">Playlists (<span id="pl-tab-count">110</span>)</button>
           <button class="tab-btn" id="tab-btn-saved" onclick="switchBrowserTab('saved')">Liked Songs (<span id="saved-tab-count">372</span>)</button>
           <button class="tab-btn" id="tab-btn-all_songs" onclick="switchBrowserTab('all_songs')">All Songs (<span id="all-songs-tab-count">2,028</span>)</button>
+          <button class="tab-btn" id="tab-btn-downloaded" onclick="switchBrowserTab('downloaded')">Downloaded Local (<span id="downloaded-tab-count">6</span>)</button>
         </div>
       </div>
       <div class="sec-head-actions">
-        <input type="text" id="browser-filter-input" placeholder="Filter playlists by name or curator…" oninput="onBrowserFilter(this.value)" style="background:#141c2b; border:1px solid var(--line-light); border-radius:4px; padding:5px 10px; font-size:12px; color:#fff; width:240px; outline:none;">
+        <input type="text" id="browser-filter-input" placeholder="Filter playlists by name or curator…" oninput="onBrowserFilter(this.value)" style="background:#141c2b; border:1px solid var(--line-light); border-radius:4px; padding:5px 10px; font-size:12px; color:#fff; width:260px; outline:none;">
       </div>
     </div>
 
     <!-- Playlists View -->
     <div id="tab-view-playlists">
       <div style="margin-bottom: 10px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-        <span style="color:var(--muted); font-size:11px;">Browse your Spotify playlists. Click any row or "Inspect Songs" to view full tracklist.</span>
-        <label style="font-size:11px; color:var(--muted); cursor:pointer; display:flex; align-items:center; gap:6px;">
-          <input type="checkbox" id="chk-only-indexed" onchange="loadPlaylists()" checked> Only playlists with tracks
-        </label>
+        <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+          <span style="color:var(--muted); font-size:11px;">Select playlists to batch download or export to FiiO microSD card.</span>
+          <span id="playlist-selected-counter" style="font-size: 11px; color: var(--accent); font-weight: 600;"></span>
+        </div>
+        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+          <button class="btn-sm primary" id="btn-dl-selected-playlists" onclick="downloadSelectedPlaylists(this)" disabled>⬇ Download Selected</button>
+          <button class="btn-sm" id="btn-dl-all-playlists" onclick="downloadAllPlaylists(this)">⬇ Download All Playlists</button>
+          <button class="btn-sm" onclick="exportAllM3uPlaylists(this)">📑 Export M3U8s</button>
+          <label style="font-size:11px; color:var(--muted); cursor:pointer; display:flex; align-items:center; gap:5px; margin-left:6px;">
+            <input type="checkbox" id="chk-only-indexed" onchange="loadPlaylists()" checked> Only with tracks
+          </label>
+          <label style="font-size:11px; color:var(--muted); cursor:pointer; display:flex; align-items:center; gap:5px;">
+            <input type="checkbox" id="chk-only-downloaded-pl" onchange="loadPlaylists()"> Only downloaded
+          </label>
+        </div>
       </div>
       <div style="max-height: 480px; overflow-y: auto; border: 1px solid var(--line); border-radius: 6px;">
         <table id="playlists-table">
           <thead>
             <tr>
+              <th style="width: 32px;"><input type="checkbox" id="select-all-playlists" onchange="toggleSelectAllPlaylists(this)" title="Select/Deselect All Playlists"></th>
               <th>Playlist Name</th>
               <th>Curator / Owner</th>
-              <th style="text-align:right;">Indexed Tracks</th>
-              <th style="text-align:right;">Total Tracks</th>
+              <th style="text-align:right;">Downloaded</th>
+              <th style="text-align:right;">Indexed</th>
+              <th style="text-align:right;">Total</th>
               <th>Status</th>
               <th style="width: 140px;">Action</th>
             </tr>
           </thead>
           <tbody id="playlists-body">
-            <tr><td colspan="6" class="empty-msg">Loading playlists…</td></tr>
+            <tr><td colspan="8" class="empty-msg">Loading playlists…</td></tr>
           </tbody>
         </table>
       </div>
@@ -958,7 +1037,12 @@ input[type="checkbox"] { cursor: pointer; }
     <!-- Songs View (Liked Songs & All Songs) -->
     <div id="tab-view-songs" style="display:none;">
       <div style="margin-bottom: 10px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-        <span id="songs-count-label" style="color:var(--muted); font-size:11px;">Showing songs from your library</span>
+        <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+          <span id="songs-count-label" style="color:var(--muted); font-size:11px;">Showing songs from your library</span>
+          <label style="font-size:11px; color:var(--muted); cursor:pointer; display:flex; align-items:center; gap:5px;">
+            <input type="checkbox" id="chk-song-downloaded-only" onchange="onSongDownloadedFilterChange()"> Only show downloaded (local disk)
+          </label>
+        </div>
         <div style="display:flex; align-items:center; gap:8px;">
           <button class="btn-sm primary" id="btn-dl-saved-batch" onclick="downloadSavedBatch(this)" style="display:none;">⬇ Download Top 20 Liked Songs</button>
           <button class="btn-sm" id="btn-song-prev" onclick="changeSongPage(-1)" disabled>◀ Previous</button>
@@ -981,6 +1065,36 @@ input[type="checkbox"] { cursor: pointer; }
           </thead>
           <tbody id="songs-body">
             <tr><td colspan="7" class="empty-msg">Loading songs…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Downloaded Local View -->
+    <div id="tab-view-downloaded" style="display:none;">
+      <div style="margin-bottom: 10px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+        <span id="downloaded-summary-label" style="color:var(--muted); font-size:11px;">Showing locally downloaded and verified FLAC files on disk</span>
+        <div style="display:flex; align-items:center; gap:8px;">
+          <button class="btn-sm" onclick="exportAllM3uPlaylists(this)">📑 Re-export M3U8 Playlists</button>
+          <button class="btn-sm primary" onclick="triggerSync(this, false)">⚡ Sync All to Card</button>
+        </div>
+      </div>
+      <div style="max-height: 480px; overflow-y: auto; border: 1px solid var(--line); border-radius: 6px;">
+        <table id="downloaded-table">
+          <thead>
+            <tr>
+              <th style="width: 44px;">#</th>
+              <th>Song Title</th>
+              <th>Artist</th>
+              <th>Album</th>
+              <th>Format</th>
+              <th style="text-align:right;">Size</th>
+              <th>Storage Location</th>
+              <th>FiiO MicroSD State</th>
+            </tr>
+          </thead>
+          <tbody id="downloaded-body">
+            <tr><td colspan="8" class="empty-msg">Loading downloaded files…</td></tr>
           </tbody>
         </table>
       </div>
@@ -1185,6 +1299,7 @@ async function refreshAll() {
     if (c.playlists != null) document.getElementById("pl-tab-count").textContent = fmt(c.playlists);
     if (c.saved_tracks != null) document.getElementById("saved-tab-count").textContent = fmt(c.saved_tracks);
     if (c.tracks != null) document.getElementById("all-songs-tab-count").textContent = fmt(c.tracks);
+    if (c.downloaded_files != null) document.getElementById("downloaded-tab-count").textContent = fmt(c.downloaded_files);
   }
 
   if (!initialPlaylistsLoaded) {
@@ -1232,6 +1347,9 @@ async function refreshAll() {
   document.getElementById("stamp").textContent = "updated " + new Date().toLocaleTimeString();
 }
 
+let selectedPlaylistIds = new Set();
+let downloadedFilesData = [];
+
 async function switchBrowserTab(tab) {
   currentBrowserTab = tab;
   document.querySelectorAll("#browser-tabs .tab-btn").forEach(b => b.classList.remove("active"));
@@ -1240,6 +1358,7 @@ async function switchBrowserTab(tab) {
 
   const plView = document.getElementById("tab-view-playlists");
   const songsView = document.getElementById("tab-view-songs");
+  const dlView = document.getElementById("tab-view-downloaded");
   const filterInput = document.getElementById("browser-filter-input");
   const btnDlSaved = document.getElementById("btn-dl-saved-batch");
   filterInput.value = "";
@@ -1248,12 +1367,14 @@ async function switchBrowserTab(tab) {
   if (tab === "playlists") {
     plView.style.display = "block";
     songsView.style.display = "none";
+    if (dlView) dlView.style.display = "none";
     if (btnDlSaved) btnDlSaved.style.display = "none";
     filterInput.placeholder = "Filter playlists by name or curator…";
     loadPlaylists();
   } else if (tab === "saved") {
     plView.style.display = "none";
     songsView.style.display = "block";
+    if (dlView) dlView.style.display = "none";
     if (btnDlSaved) btnDlSaved.style.display = "inline-flex";
     filterInput.placeholder = "Filter liked songs…";
     document.getElementById("songs-count-label").textContent = "Showing Spotify Liked Songs";
@@ -1262,50 +1383,206 @@ async function switchBrowserTab(tab) {
   } else if (tab === "all_songs") {
     plView.style.display = "none";
     songsView.style.display = "block";
+    if (dlView) dlView.style.display = "none";
     if (btnDlSaved) btnDlSaved.style.display = "none";
     filterInput.placeholder = "Filter all songs by title, artist, or album…";
     document.getElementById("songs-count-label").textContent = "Showing All Library Songs";
     currentSongPage = 1;
     loadSongs();
+  } else if (tab === "downloaded") {
+    plView.style.display = "none";
+    songsView.style.display = "none";
+    if (dlView) dlView.style.display = "block";
+    if (btnDlSaved) btnDlSaved.style.display = "none";
+    filterInput.placeholder = "Filter downloaded songs by title, artist, or album…";
+    loadDownloadedFiles();
   }
 }
 
 async function loadPlaylists() {
   const onlyIndexed = document.getElementById("chk-only-indexed").checked;
+  const onlyDownloaded = document.getElementById("chk-only-downloaded-pl") ? document.getElementById("chk-only-downloaded-pl").checked : false;
   const q = document.getElementById("browser-filter-input").value.trim();
   const tbody = document.getElementById("playlists-body");
-  const data = await safeFetch(`/api/playlists?only_with_tracks=${onlyIndexed ? "true" : "false"}&q=${encodeURIComponent(q)}`);
+  const data = await safeFetch(`/api/playlists?only_with_tracks=${onlyIndexed ? "true" : "false"}&only_downloaded=${onlyDownloaded ? "true" : "false"}&q=${encodeURIComponent(q)}`);
   if (!data || data.error) {
-    tbody.innerHTML = `<tr><td colspan="6" class="empty-msg">Error loading playlists: ${data ? data.error : "network"}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8" class="empty-msg">Error loading playlists: ${data ? data.error : "network"}</td></tr>`;
     return;
   }
   playlistsData = data.playlists || [];
-  if (!q && !onlyIndexed) {
+  if (!q && !onlyIndexed && !onlyDownloaded) {
     document.getElementById("pl-tab-count").textContent = fmt(playlistsData.length);
   }
+  renderPlaylistsRows();
+}
+
+function renderPlaylistsRows() {
+  const tbody = document.getElementById("playlists-body");
   if (!playlistsData.length) {
-    tbody.innerHTML = `<tr><td colspan="6" class="empty-msg">No playlists match current filter</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8" class="empty-msg">No playlists match current filter</td></tr>`;
+    updatePlaylistSelectionUI();
     return;
   }
-  tbody.innerHTML = playlistsData.map(p => `
-    <tr class="clickable-row" onclick="openPlaylist(${p.id})">
-      <td><b>${p.name}</b>${p.description ? `<br><span style="color:var(--muted); font-size:11px;">${p.description.slice(0, 75)}</span>` : ""}</td>
-      <td>${p.owner_name}</td>
-      <td style="text-align:right;">${p.indexed_tracks > 0 ? `<b class="ok">${p.indexed_tracks}</b>` : `<span style="color:var(--muted); font-size:11px;">0</span>`}</td>
-      <td style="text-align:right;">${p.total_tracks}</td>
-      <td><span class="badge ${p.indexed_tracks > 0 ? "ok" : "warn"}">${p.indexed_tracks > 0 ? "Ready (" + p.indexed_tracks + " songs)" : "Third-Party"}</span></td>
-      <td>
-        <button class="btn-sm" onclick="event.stopPropagation(); openPlaylist(${p.id})">Inspect (${p.indexed_tracks}) ▶</button>
-      </td>
-    </tr>
-  `).join("");
+  tbody.innerHTML = playlistsData.map(p => {
+    const isChecked = selectedPlaylistIds.has(p.id);
+    const canSelect = p.indexed_tracks > 0;
+    let statusBadge = "";
+    if (p.indexed_tracks > 0) {
+      if (p.downloaded_tracks >= p.indexed_tracks) {
+        statusBadge = '<span class="badge ok">✓ Full Local</span>';
+      } else if (p.downloaded_tracks > 0) {
+        statusBadge = `<span class="badge sync">${p.downloaded_tracks}/${p.indexed_tracks} Local</span>`;
+      } else {
+        statusBadge = '<span class="badge warn">Cloud Only</span>';
+      }
+    } else {
+      statusBadge = '<span class="badge" style="color:var(--muted);">Empty</span>';
+    }
+
+    return `
+      <tr class="clickable-row" onclick="openPlaylist(${p.id})">
+        <td onclick="event.stopPropagation()">
+          <input type="checkbox" data-pl-id="${p.id}" ${isChecked ? "checked" : ""} ${canSelect ? "" : "disabled"} onchange="onPlaylistSelectChange(${p.id}, this.checked)">
+        </td>
+        <td><b>${escapeHtml(p.name)}</b>${p.description ? `<br><span style="color:var(--muted); font-size:11px;">${escapeHtml(p.description.slice(0, 75))}</span>` : ""}</td>
+        <td>${escapeHtml(p.owner_name)}</td>
+        <td style="text-align:right;">${p.downloaded_tracks > 0 ? `<b class="ok">${fmt(p.downloaded_tracks)}</b>` : `<span style="color:var(--muted); font-size:11px;">0</span>`}</td>
+        <td style="text-align:right;">${p.indexed_tracks > 0 ? `<b>${fmt(p.indexed_tracks)}</b>` : `<span style="color:var(--muted); font-size:11px;">0</span>`}</td>
+        <td style="text-align:right;">${fmt(p.total_tracks)}</td>
+        <td>${statusBadge}</td>
+        <td>
+          <button class="btn-sm" onclick="event.stopPropagation(); openPlaylist(${p.id})">Inspect (${p.indexed_tracks}) ▶</button>
+        </td>
+      </tr>
+    `;
+  }).join("");
+  updatePlaylistSelectionUI();
+}
+
+function onPlaylistSelectChange(id, checked) {
+  if (checked) {
+    selectedPlaylistIds.add(id);
+  } else {
+    selectedPlaylistIds.delete(id);
+  }
+  updatePlaylistSelectionUI();
+}
+
+function toggleSelectAllPlaylists(master) {
+  if (master.checked) {
+    playlistsData.forEach(p => {
+      if (p.indexed_tracks > 0) selectedPlaylistIds.add(p.id);
+    });
+  } else {
+    selectedPlaylistIds.clear();
+  }
+  renderPlaylistsRows();
+}
+
+function updatePlaylistSelectionUI() {
+  const count = selectedPlaylistIds.size;
+  const counter = document.getElementById("playlist-selected-counter");
+  const btn = document.getElementById("btn-dl-selected-playlists");
+  const master = document.getElementById("select-all-playlists");
+  if (counter) counter.textContent = count ? `(${count} selected)` : "";
+  if (btn) btn.disabled = count === 0;
+  const selectable = playlistsData.filter(p => p.indexed_tracks > 0);
+  if (master && selectable.length > 0) {
+    master.checked = count === selectable.length && count > 0;
+    master.indeterminate = count > 0 && count < selectable.length;
+  }
+}
+
+async function downloadSelectedPlaylists(btn) {
+  const pids = Array.from(selectedPlaylistIds);
+  if (!pids.length) return;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "⏳ Downloading…";
+  }
+  showToast(`Downloading ${pids.length} selected playlists in batch…`);
+  pollActivity();
+  try {
+    const res = await fetch(`/api/actions/download-playlists-batch?playlist_ids=${pids.join(",")}&max_tracks_per_playlist=30`, { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      showToast(`Batch completed: ${data.downloaded} new tracks downloaded, ${data.skipped} skipped across ${data.playlists_processed} playlists!`);
+      selectedPlaylistIds.clear();
+      loadPlaylists();
+      refreshAll();
+    } else {
+      showToast("Batch download error: " + (data.error || "failed"), true);
+    }
+  } catch (err) {
+    showToast("Error: " + err.message, true);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "⬇ Download Selected";
+    }
+    pollActivity();
+  }
+}
+
+async function downloadAllPlaylists(btn) {
+  if (!confirm("Download all indexed playlists into local FLAC storage & export M3U8s?")) return;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "⏳ Downloading All…";
+  }
+  showToast("Starting batch download for ALL indexed playlists…");
+  pollActivity();
+  try {
+    const res = await fetch("/api/actions/download-all-playlists?max_tracks_per_playlist=30", { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      showToast(`All playlists complete: ${data.downloaded} downloaded, ${data.skipped} skipped!`);
+      loadPlaylists();
+      refreshAll();
+    } else {
+      showToast("Download all error: " + (data.error || "failed"), true);
+    }
+  } catch (err) {
+    showToast("Error: " + err.message, true);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "⬇ Download All Playlists";
+    }
+    pollActivity();
+  }
+}
+
+async function exportAllM3uPlaylists(btn) {
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "⏳ Exporting…";
+  }
+  showToast("Exporting M3U8 playlists for FiiO player…");
+  try {
+    const res = await fetch("/api/actions/export-playlists", { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      showToast(`M3U8 playlists updated: ${data.exported} playlists generated (${data.total_tracks} tracks).`);
+    } else {
+      showToast("Export error: " + (data.error || "failed"), true);
+    }
+  } catch (err) {
+    showToast("Error: " + err.message, true);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "📑 Export M3U8s";
+    }
+  }
 }
 
 async function loadSongs() {
   const tbody = document.getElementById("songs-body");
   const category = (currentBrowserTab === "saved") ? "saved" : "all";
   const q = songFilterQuery;
-  const data = await safeFetch(`/api/songs?category=${category}&q=${encodeURIComponent(q)}&page=${currentSongPage}&page_size=50`);
+  const onlyDl = document.getElementById("chk-song-downloaded-only") ? document.getElementById("chk-song-downloaded-only").checked : false;
+  const data = await safeFetch(`/api/songs?category=${category}&only_downloaded=${onlyDl ? "true" : "false"}&q=${encodeURIComponent(q)}&page=${currentSongPage}&page_size=50`);
   if (!data || data.error) {
     tbody.innerHTML = `<tr><td colspan="7" class="empty-msg">Error loading songs: ${data ? data.error : "network"}</td></tr>`;
     return;
@@ -1317,11 +1594,11 @@ async function loadSongs() {
   document.getElementById("btn-song-next").disabled = data.page >= totalSongPages;
 
   if (category === "saved") {
-    if (!q) document.getElementById("saved-tab-count").textContent = fmt(data.total);
-    document.getElementById("songs-count-label").textContent = `Showing ${fmt(data.total)} Spotify Liked Songs`;
+    if (!q && !onlyDl) document.getElementById("saved-tab-count").textContent = fmt(data.total);
+    document.getElementById("songs-count-label").textContent = `Showing ${fmt(data.total)} Spotify Liked Songs${onlyDl ? " (Downloaded Only)" : ""}`;
   } else {
-    if (!q) document.getElementById("all-songs-tab-count").textContent = fmt(data.total);
-    document.getElementById("songs-count-label").textContent = `Showing ${fmt(data.total)} Library Songs`;
+    if (!q && !onlyDl) document.getElementById("all-songs-tab-count").textContent = fmt(data.total);
+    document.getElementById("songs-count-label").textContent = `Showing ${fmt(data.total)} Library Songs${onlyDl ? " (Downloaded Only)" : ""}`;
   }
 
   if (!songs.length) {
@@ -1333,14 +1610,54 @@ async function loadSongs() {
   tbody.innerHTML = songs.map((s, idx) => `
     <tr>
       <td style="color:var(--muted);">${offset + idx + 1}</td>
-      <td><b>${s.title}</b></td>
-      <td>${s.artist_name}</td>
-      <td>${s.album_title}</td>
+      <td><b>${escapeHtml(s.title)}</b></td>
+      <td>${escapeHtml(s.artist_name)}</td>
+      <td>${escapeHtml(s.album_title)}</td>
       <td style="text-align:right;">${msToMin(s.duration_ms)}</td>
       <td>${s.validated ? '<span class="badge ok">✓ On Disk / Ready</span>' : (s.path ? '<span class="badge sync">Local Matched</span>' : '<span class="badge">Spotify Cloud</span>')}</td>
       <td>
         ${s.validated ? '<span class="badge ok">✓ Ready</span>' : `<button class="btn-sm" onclick="downloadSongRow(${s.id}, this)">⬇ Download</button>`}
       </td>
+    </tr>
+  `).join("");
+}
+
+function onSongDownloadedFilterChange() {
+  currentSongPage = 1;
+  loadSongs();
+}
+
+async function loadDownloadedFiles() {
+  const tbody = document.getElementById("downloaded-body");
+  const q = document.getElementById("browser-filter-input").value.trim();
+  const data = await safeFetch(`/api/downloaded-files?q=${encodeURIComponent(q)}`);
+  if (!data || data.error) {
+    tbody.innerHTML = `<tr><td colspan="8" class="empty-msg">Error loading downloaded files: ${data ? data.error : "network"}</td></tr>`;
+    return;
+  }
+  downloadedFilesData = data.files || [];
+  const label = document.getElementById("downloaded-summary-label");
+  if (label) {
+    label.innerHTML = `<b>${fmt(data.count)}</b> audio tracks stored locally on disk (<b>${gb(data.total_bytes)}</b>)`;
+  }
+  const tabBadge = document.getElementById("downloaded-tab-count");
+  if (tabBadge && !q) {
+    tabBadge.textContent = fmt(data.count);
+  }
+  if (!downloadedFilesData.length) {
+    tbody.innerHTML = `<tr><td colspan="8" class="empty-msg">No downloaded local files match query</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = downloadedFilesData.map((f, idx) => `
+    <tr>
+      <td style="color:var(--muted);">${idx + 1}</td>
+      <td><b>${escapeHtml(f.title)}</b></td>
+      <td>${escapeHtml(f.artist_name)}</td>
+      <td>${escapeHtml(f.album_title)}</td>
+      <td><span class="badge ok">${escapeHtml((f.format || "FLAC").toUpperCase())}</span></td>
+      <td style="text-align:right;">${(f.size_bytes / 1024 / 1024).toFixed(1)} MB</td>
+      <td style="color:var(--muted); font-size:11px; max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(f.path)}">${escapeHtml(f.rel_path || f.path)}</td>
+      <td><span class="badge ok">✓ Card Ready</span></td>
     </tr>
   `).join("");
 }
@@ -1358,6 +1675,8 @@ function onBrowserFilter(val) {
   browserFilterTimer = setTimeout(() => {
     if (currentBrowserTab === "playlists") {
       loadPlaylists();
+    } else if (currentBrowserTab === "downloaded") {
+      loadDownloadedFiles();
     } else {
       songFilterQuery = val.trim();
       currentSongPage = 1;

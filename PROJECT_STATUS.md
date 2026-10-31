@@ -50,16 +50,19 @@ Last Updated: 2026-11-01
   - Added CLI `musicctl download --track <id>`, `--playlist <id>`, and `--saved [--limit <n>]`.
   - Added automated macOS `dot_clean -m` execution directly in `fiiolib.sync.planner.execute()` to strip and merge all AppleDouble `._*` resource fork files upon writing to the microSD card.
   - Successfully downloaded, validated, organised, and live-synced 6 FLAC tracks to `/Volumes/sandisk64/Music`.
-- **Phase 8: On-Screen Live Activity, Execution & Failure Monitor**:
-  - Implemented thread-safe [`ActivityLogger`](file:///Users/hiteshkumar/local_music/src/fiiolib/activity.py) ring buffer and execution state monitor.
-  - Added dedicated **Live Activity & Execution Monitor** section to the web dashboard at `http://127.0.0.1:8765`.
-  - Added live terminal console with timestamped, categorized entries for `[SYNC]`, `[DOWNLOAD]`, `[TRANSCODE]`, `[VALIDATE]`, and `[SYSTEM]`.
-  - Added active task progress bar displaying currently active track, ratio (e.g. `3 / 10`), and percentage.
-  - Added dedicated **Failed Tracks Alert & Retry Box**: highlights failing tracks with title, artist, exact error message, and a 1-click **⬇ Retry Download** button.
-  - Real-time polling with smooth auto-scroll toggle and console clear controls.
+- **Phase 9: Multi-Playlist Batch Acquisition, Card M3U8 Organization & Local Files Browser**:
+  - Implemented multi-playlist selection with individual row checkboxes, master select-all/deselect-all toggle, selection counter, and batch download runner (`POST /api/actions/download-playlists-batch`).
+  - Added 1-click "⬇ Download All Playlists" to sequentially download all indexed library playlists into local FLAC storage.
+  - Implemented compliant UTF-8 `.m3u8` playlist generator (`export_playlist_m3u` & `export_all_playlists`) using `#EXTM3U`, `#EXTINF`, and relative paths (`../Music/...`) pointing directly to audio tracks without audio duplication.
+  - Updated card sync in [planner.py](file:///Users/hiteshkumar/local_music/src/fiiolib/sync/planner.py) to automatically write playlists to `/Volumes/sandisk64/Playlists/` and run `dot_clean -m` across both `Music` and `Playlists` folders.
+  - Added dedicated **Downloaded Local (<span id="downloaded-tab-count">21</span>)** 4th tab in the dashboard browser showing all locally stored audio tracks with file size, format, storage path, and FiiO card sync badge.
+  - Added "Only show downloaded" filter toggle in Liked Songs and All Songs views.
+  - Expanded test suite: 28 passed, 1 skipped.
 
 ### Current Card State (/Volumes/sandisk64)
-- **Files Synced**: 6 FLAC tracks (Bappi Lahiri, Suleymer, Television Blonde, Minaxi, Adriano Celentano, Lorie Ladd).
-- **AppleDouble Artifacts**: 0 (cleaned automatically).
-- **Free Space**: 59.3 GB (1.5 GB reserve enforced).
+- **Audio Files Synced**: 21 FLAC tracks across 15+ albums (Bappi Lahiri, Kishore Kumar, Vijay Benedict, Asha Bhosle, Alisha Chinai, Alka Yagnik, etc.).
+- **Playlists Synced**: 3 UTF-8 M3U8 playlists (`Playlists/Discooo.m3u8`, `Playlists/Discooo Reboot.m3u8`, `Playlists/Deep Hypnotic Underground Techno Progressive.m3u8`).
+- **AppleDouble Artifacts**: 0 (cleaned automatically with `dot_clean -m`).
+- **Free Space**: ~58.2 GB (1.5 GB reserve enforced).
+
 
