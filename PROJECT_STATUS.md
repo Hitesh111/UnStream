@@ -2,7 +2,7 @@
 
 Last Updated: 2026-11-01
 
-## Current Phase: Phase 2 (Device Confirmation & Pipeline Readiness) [COMPLETED]
+## Current Phase: Phase 3 (Spotify Ingestion & Taste Profile) [COMPLETED]
 
 ### Completed Work
 - **Phase 1: Environment & Foundation Setup**:
@@ -15,20 +15,26 @@ Last Updated: 2026-11-01
   - Confirmed `/Volumes/sandisk64` as trusted target device (`musicctl device confirm --device sandisk64 --yes`).
   - Fixed volume confirmation display in `musicctl status` to reflect database registration state accurately.
   - Verified non-destructive dry-run sync planner (`musicctl sync --dry-run` verified 0 writes, 1.5GB capacity reserve enforced).
-  - Verified Markdown/JSON report generator (`musicctl report`).
-  - Verified discovery sources registry (`musicctl sources`).
+- **Phase 3: Spotify Connection & Taste Profile**:
+  - Configured Spotify app credentials with PKCE OAuth 2.0 flow.
+  - Exchanged tokens and stored securely in macOS Keychain (`security` CLI).
+  - Executed incremental Spotify library sync:
+    - 1,606 Albums, 1,918 Artists, 2,047 Tracks imported.
+    - 372 Saved Tracks, 110 Playlists analyzed.
+  - Generated explainable taste profile (`musicctl spotify profile`):
+    - Top artists identified: Bappi Lahiri, A.R. Rahman, Chris Isaak, Asha Bhosle, Gipsy Kings, Efterklang, Lata Mangeshkar, Cluster, Ananda Shankar, Beak>, Kishore Kumar, Karsh Kale, CAN, Nusrat Fateh Ali Khan.
+    - Era distribution: 1980s (top), 2010s, 2020s, 2000s, 1990s, 1970s.
   - Verified test suite: 24 passed, 1 skipped (optional libtorrent), 0 failed.
 
 ### Current Work
-- Phase 3: Spotify Connection & Taste Profiling.
-  - Ready for user's Spotify Developer App Client ID.
-  - PKCE login (`musicctl spotify login --client-id <ID>`) with callback at `http://127.0.0.1:8888/callback`.
-  - Incremental library import and transparent taste profile calculation.
+- Phase 4: Discovery, Rights-Gating & Authorised Candidate Matching.
+  - Querying MusicBrainz and Internet Archive for releases matching taste profile artists.
+  - Enforcing strict legal rights filtering (only explicit CC, public domain, or label-authorised).
 
 ### Blockers
-- Awaiting Spotify Client ID to initiate live OAuth PKCE handshake.
+- None. System is fully operational and authenticated.
 
 ### Next Actions
-1. Prompt user for Spotify Developer App Client ID.
-2. Run PKCE authentication and incremental sync (`musicctl spotify login` -> `musicctl spotify sync`).
-3. Run taste profile evaluation (`musicctl spotify profile`).
+1. Run discovery engine (`musicctl discover --limit 5`) to surface candidate releases with explicit rights.
+2. Review candidate approval queue (`musicctl queue list`).
+3. Prepare verified audio processing pipeline.

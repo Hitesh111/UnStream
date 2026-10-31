@@ -16,11 +16,12 @@
 - [x] Test non-destructive dry-run sync planner (`musicctl sync --dry-run`).
 - [x] Verify report generation (`musicctl report`) and discovery source listing.
 
-## Phase 3: Spotify Integration & Taste Profile
-- [ ] Receive Spotify Developer App Client ID from user.
-- [ ] Authenticate via PKCE flow (`musicctl spotify login`).
-- [ ] Perform incremental library and playlist fetch (`musicctl spotify sync`).
-- [ ] Generate taste profile scoring and genre mapping (`musicctl spotify profile`).
+## Phase 3: Spotify Integration & Taste Profile [COMPLETED]
+- [x] Receive and configure Spotify Developer App Client ID.
+- [x] Authenticate via PKCE flow (`musicctl spotify login`).
+- [x] Securely store tokens in macOS Keychain (`security` CLI).
+- [x] Perform incremental library and playlist fetch (`musicctl spotify sync`).
+- [x] Generate taste profile scoring and era breakdown (`musicctl spotify profile`).
 
 ## Phase 4: Discovery, Rights-Gating & Acquisitions
 - [ ] Query MusicBrainz and Internet Archive candidates based on taste profile.
