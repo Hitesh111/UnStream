@@ -1,4 +1,4 @@
-"""Local-only FastAPI dashboard (127.0.0.1, read-only JSON + static page)."""
+"""Local-only FastAPI dashboard (127.0.0.1, read-only JSON + static page + actions)."""
 
 from __future__ import annotations
 
@@ -13,11 +13,15 @@ from fiiolib.config import Config
 from fiiolib.db import Database
 from fiiolib.device.detect import DeviceError, DeviceLocator
 from fiiolib.discovery.engine import candidate_rows
+from fiiolib.downloads.manager import DownloadManager
 from fiiolib.library.queries import library_stats
 from fiiolib.library.reports import report_payload
+from fiiolib.library.scanner import LibraryScanner
 from fiiolib.spotify.auth import SpotifyAuth
-from fiiolib.spotify.sync import status_summary
+from fiiolib.spotify.client import SpotifyClient
+from fiiolib.spotify.sync import SpotifyImporter, status_summary
 from fiiolib.spotify.taste import PROFILE_KEY
+from fiiolib.sync.planner import SyncPlanner
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +90,7 @@ def create_app(config: Config, db: Database) -> FastAPI:
         acquisitions = [
             dict(row)
             for row in db.query(
-                "SELECT a.id, a.status, a.updated_at, r.title, r.artist_credit, r.licence "
+                "SELECT a.id, a.status, a.updated_at, r.title, r.artist_name, r.licence "
                 "FROM acquisitions a JOIN releases r ON r.id = a.release_id "
                 "ORDER BY a.id DESC LIMIT 50"
             )
@@ -109,6 +113,63 @@ def create_app(config: Config, db: Database) -> FastAPI:
             ]
         }
 
+    @app.post("/api/actions/sync")
+    def action_sync(dry_run: bool = Query(default=True)) -> dict[str, Any]:
+        try:
+            planner = SyncPlanner(config, db)
+            plan = planner.plan()
+            if not dry_run and plan.fits:
+                result = planner.execute(plan, dry_run=False)
+                return {"ok": True, "action": "sync", "result": result}
+            return {"ok": True, "action": "plan", "plan": plan.as_dict()}
+        except Exception as exc:
+            logger.exception("Dashboard sync action failed")
+            return {"ok": False, "error": str(exc)}
+
+    @app.post("/api/actions/scan")
+    def action_scan() -> dict[str, Any]:
+        try:
+            scanner = LibraryScanner(config, db)
+            summary = scanner.scan()
+            return {"ok": True, "summary": summary.as_dict()}
+        except Exception as exc:
+            logger.exception("Dashboard scan action failed")
+            return {"ok": False, "error": str(exc)}
+
+    @app.post("/api/actions/approve")
+    def action_approve(candidate_id: int = Query(...)) -> dict[str, Any]:
+        try:
+            manager = DownloadManager(config, db)
+            res = manager.approve(candidate_id)
+            return {"ok": True, "result": res}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @app.post("/api/actions/reject")
+    def action_reject(candidate_id: int = Query(...)) -> dict[str, Any]:
+        try:
+            manager = DownloadManager(config, db)
+            res = manager.reject(candidate_id)
+            return {"ok": True, "result": res}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    @app.post("/api/actions/spotify-sync")
+    def action_spotify_sync() -> dict[str, Any]:
+        auth = SpotifyAuth(config, db)
+        if not auth.is_logged_in():
+            return {"ok": False, "error": "Spotify not logged in"}
+        client = SpotifyClient(config, db, auth=auth)
+        try:
+            importer = SpotifyImporter(config, db, client)
+            summary = importer.run_incremental()
+            return {"ok": True, "summary": summary}
+        except Exception as exc:
+            logger.exception("Dashboard Spotify sync failed")
+            return {"ok": False, "error": str(exc)}
+        finally:
+            client.close()
+
     @app.exception_handler(DeviceError)
     def device_error(_: Request, exc: DeviceError) -> JSONResponse:
         return JSONResponse({"detail": str(exc)}, status_code=409)
@@ -124,7 +185,14 @@ def _status(config: Config, db: Database) -> dict[str, Any]:
     capabilities: dict[str, Any] = {}
     try:
         volumes = DeviceLocator(config).candidates()
-        capabilities["devices"] = [volume.as_dict() for volume in volumes]
+        confirmed = {
+            str(row["identifier"]): bool(row["confirmed"])
+            for row in db.query("SELECT identifier, confirmed FROM devices")
+        }
+        capabilities["devices"] = [
+            {**volume.as_dict(), "confirmed": confirmed.get(volume.identifier, False)}
+            for volume in volumes
+        ]
     except DeviceError as exc:
         capabilities["devices"] = []
         capabilities["device_error"] = str(exc)
@@ -146,82 +214,507 @@ def _status(config: Config, db: Database) -> dict[str, Any]:
 
 
 INDEX_HTML = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
+<html lang="en">
+<head>
+<meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>FiiO Library Manager</title>
+<title>FiiO Echo Mini — Library Manager</title>
 <style>
-:root { color-scheme: dark; --bg:#0d1117; --panel:#161b22; --line:#30363d; --fg:#e6edf3; --muted:#8b949e; --accent:#2f81f7; --good:#3fb950; --warn:#d29922; --bad:#f85149; }
+:root {
+  color-scheme: dark;
+  --bg: #090d13;
+  --panel: #111722;
+  --panel-hover: #161e2c;
+  --line: #222c3d;
+  --line-light: #2d3a50;
+  --fg: #e2e8f0;
+  --muted: #8b9bb4;
+  --accent: #38bdf8;
+  --accent-hover: #0284c7;
+  --good: #34d399;
+  --warn: #fbbf24;
+  --bad: #f87171;
+}
 * { box-sizing: border-box; }
-body { margin:0; font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:var(--bg); color:var(--fg); }
-header { padding:20px 28px; border-bottom:1px solid var(--line); display:flex; gap:16px; align-items:baseline; }
-header h1 { margin:0; font-size:18px; letter-spacing:.02em; }
-header span { color:var(--muted); font-size:12px; }
-main { padding:24px 28px; display:grid; gap:20px; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); }
-section { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px 18px; }
-h2 { margin:0 0 12px; font-size:13px; text-transform:uppercase; letter-spacing:.08em; color:var(--muted); }
-.kv { display:flex; justify-content:space-between; gap:12px; padding:4px 0; border-bottom:1px dashed #21262d; }
-.kv:last-child { border:0; }
-.kv b { font-weight:600; font-variant-numeric:tabular-nums; }
-table { width:100%; border-collapse:collapse; font-size:12px; }
-td,th { text-align:left; padding:5px 6px; border-bottom:1px solid #21262d; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:260px; }
-th { color:var(--muted); font-weight:500; }
-.badge { display:inline-block; padding:1px 7px; border-radius:999px; font-size:11px; border:1px solid var(--line); }
-.ok { color:var(--good); } .warn { color:var(--warn); } .bad { color:var(--bad); }
-footer { padding:8px 28px 24px; color:var(--muted); font-size:11px; }
-</style></head>
+body {
+  margin: 0;
+  font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+}
+header {
+  padding: 16px 28px;
+  background: #0d131d;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+.brand { display: flex; align-items: baseline; gap: 12px; }
+.brand h1 { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -0.01em; color: #fff; }
+.brand span { color: var(--muted); font-size: 12px; }
+.header-actions { display: flex; align-items: center; gap: 8px; }
+button {
+  background: #1e293b;
+  border: 1px solid var(--line-light);
+  color: var(--fg);
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+button:hover { background: #334155; border-color: var(--accent); }
+button.primary { background: #0284c7; border-color: #38bdf8; color: #fff; }
+button.primary:hover { background: #0369a1; }
+button.danger { background: #7f1d1d; border-color: #ef4444; color: #fecaca; }
+button.danger:hover { background: #991b1b; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+#toast {
+  padding: 8px 16px;
+  background: #1e293b;
+  border-left: 3px solid var(--accent);
+  margin: 12px 28px 0;
+  border-radius: 4px;
+  font-size: 12px;
+  display: none;
+}
+main {
+  padding: 20px 28px;
+  display: grid;
+  gap: 18px;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+}
+section {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+}
+section.full-width {
+  grid-column: 1 / -1;
+}
+.sec-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 8px;
+}
+h2 {
+  margin: 0;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  font-weight: 600;
+}
+.kv {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 5px 0;
+  border-bottom: 1px dashed rgba(255,255,255,0.05);
+}
+.kv:last-child { border: 0; }
+.kv b { font-weight: 600; font-variant-numeric: tabular-nums; }
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+td, th {
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 1px solid #192233;
+}
+th {
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+tr:hover td { background: rgba(255,255,255,0.02); }
+.badge {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.badge.ok { background: rgba(52, 211, 153, 0.15); color: var(--good); border: 1px solid rgba(52, 211, 153, 0.3); }
+.badge.warn { background: rgba(251, 191, 36, 0.15); color: var(--warn); border: 1px solid rgba(251, 191, 36, 0.3); }
+.badge.bad { background: rgba(248, 113, 113, 0.15); color: var(--bad); border: 1px solid rgba(248, 113, 113, 0.3); }
+.ok { color: var(--good); }
+.warn { color: var(--warn); }
+.bad { color: var(--bad); }
+footer {
+  padding: 12px 28px 32px;
+  color: var(--muted);
+  font-size: 11px;
+  display: flex;
+  justify-content: space-between;
+}
+.btn-sm { padding: 3px 8px; font-size: 11px; border-radius: 4px; }
+.empty-msg { color: var(--muted); font-size: 12px; padding: 12px 0; font-style: italic; }
+</style>
+</head>
 <body>
-<header><h1>FiiO Library Manager</h1><span id="stamp">loading…</span></header>
+<header>
+  <div class="brand">
+    <h1>FiiO SNOWSKY Echo Mini</h1>
+    <span>Library Manager & Sync</span>
+    <span id="stamp" style="font-size: 11px;">connecting…</span>
+  </div>
+  <div class="header-actions">
+    <button onclick="triggerScan(this)">🔍 Scan Library</button>
+    <button onclick="triggerSync(this, true)">📋 Preview Sync</button>
+    <button class="primary" onclick="triggerSync(this, false)">⚡ Sync Card Now</button>
+    <button onclick="refreshAll()">↻ Refresh</button>
+  </div>
+</header>
+
+<div id="toast"></div>
+
 <main>
-  <section><h2>Library</h2><div id="library"></div></section>
-  <section><h2>Spotify</h2><div id="spotify"></div></section>
-  <section><h2>Devices</h2><div id="devices"></div></section>
-  <section><h2>Pipeline</h2><div id="pipeline"></div></section>
-  <section><h2>Recent sync</h2><table id="sync"></table></section>
-  <section><h2>Acquisitions</h2><table id="downloads"></table></section>
-  <section><h2>Automation</h2><table id="automation"></table></section>
+  <!-- Library Status -->
+  <section>
+    <div class="sec-head"><h2>Verified Library</h2><span id="lib-status" class="badge ok">local</span></div>
+    <div id="library">Loading…</div>
+  </section>
+
+  <!-- Spotify Connection -->
+  <section>
+    <div class="sec-head">
+      <h2>Spotify Taste Profile</h2>
+      <button class="btn-sm" onclick="triggerSpotifySync(this)">Sync Spotify</button>
+    </div>
+    <div id="spotify">Loading…</div>
+  </section>
+
+  <!-- Target MicroSD Device -->
+  <section>
+    <div class="sec-head"><h2>Target MicroSD Card</h2><span id="card-badge" class="badge">detecting</span></div>
+    <div id="devices">Loading…</div>
+  </section>
+
+  <!-- Pipeline Counts -->
+  <section>
+    <div class="sec-head"><h2>Pipeline & Safety</h2></div>
+    <div id="pipeline">Loading…</div>
+  </section>
+
+  <!-- Candidates with Interactive Action -->
+  <section class="full-width">
+    <div class="sec-head">
+      <h2>Discovery Candidates (Awaiting Review)</h2>
+      <span class="badge warn" id="cand-count">0 pending</span>
+    </div>
+    <div style="overflow-x:auto;">
+      <table id="candidates-table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Artist</th>
+            <th>Release</th>
+            <th>Score</th>
+            <th>Licence Rights</th>
+            <th>Reason</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody id="candidates-body">
+          <tr><td colspan="7" class="empty-msg">No candidates awaiting review</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Sync History -->
+  <section>
+    <div class="sec-head"><h2>Recent Sync Runs</h2></div>
+    <table id="sync-table">
+      <thead><tr><th>#</th><th>Date</th><th>Status</th><th>Added</th><th>Skipped</th></tr></thead>
+      <tbody id="sync-body"></tbody>
+    </table>
+  </section>
+
+  <!-- Automated Jobs -->
+  <section>
+    <div class="sec-head"><h2>Scheduled Tasks</h2></div>
+    <table id="auto-table">
+      <thead><tr><th>Task</th><th>Schedule</th><th>Last Executed</th><th>Due</th></tr></thead>
+      <tbody id="auto-body"></tbody>
+    </table>
+  </section>
 </main>
-<footer>Local-only dashboard. Read-only. Refreshed automatically every 15 s.</footer>
+
+<footer>
+  <span>Local loopback only (127.0.0.1). Hardware limits strictly checked against Echo Mini.</span>
+  <span>Auto-refreshes every 10 seconds</span>
+</footer>
+
 <script>
 const fmt = n => n == null ? "-" : new Intl.NumberFormat().format(n);
-const gb = n => (n/1024/1024/1024).toFixed(2) + " GB";
+const gb = n => (n == null || isNaN(n)) ? "0.00 GB" : (n/1024/1024/1024).toFixed(2) + " GB";
 const kv = (label, value, cls="") => `<div class="kv"><span>${label}</span><b class="${cls}">${value}</b></div>`;
-async function json(url){ const r = await fetch(url); if(!r.ok) throw new Error(url+" "+r.status); return r.json(); }
-async function refresh(){
+
+function showToast(msg, isError=false) {
+  const el = document.getElementById("toast");
+  el.style.display = "block";
+  el.style.borderColor = isError ? "var(--bad)" : "var(--accent)";
+  el.innerHTML = msg;
+  setTimeout(() => { el.style.display = "none"; }, 7000);
+}
+
+async function safeFetch(url) {
   try {
-    const [s, lib, dev, syn, dl, auto] = await Promise.all([
-      json("/api/status"), json("/api/library"), json("/api/devices"), json("/api/sync"),
-      json("/api/downloads"), json("/api/automation")
-    ]);
-    document.getElementById("library").innerHTML =
-      kv("Files", fmt(lib.files)) + kv("Verified FLAC", fmt(lib.verified_flac)) +
-      kv("Albums / artists", fmt(lib.albums)+" / "+fmt(lib.artists)) +
-      kv("Size", gb(lib.size_bytes)) + kv("Transcode suspects", fmt(lib.transcode_suspect), lib.transcode_suspect?"warn":"");
-    const sp = s.spotify || {};
-    const sc = sp.counts || {};
-    document.getElementById("spotify").innerHTML =
-      kv("Connected", sp.logged_in ? "yes" : "no", sp.logged_in?"ok":"bad") +
-      kv("Saved tracks", fmt(sc.saved_tracks)) + kv("Playlists", fmt(sc.playlists)) +
-      kv("Taste artists", fmt(sp.profile_artists)) + kv("Last sync", sp.last_sync || "never");
-    const dv = dev.volumes || [];
-    document.getElementById("devices").innerHTML = dv.length ? dv.map(v =>
-      kv(v.volume_name+" · "+v.filesystem, v.capacity_gb+" GB" + (v.confirmed?" · confirmed":" · unconfirmed"), v.confirmed?"ok":"warn")
-    ).join("") + (dev.error?kv("Note", dev.error, "warn"):"") : kv("Card", "not mounted", "warn");
-    const c = s.counts || {};
-    document.getElementById("pipeline").innerHTML =
-      kv("Candidates", fmt(c.candidates)) + kv("Awaiting approval", fmt(c.awaiting_approval), c.awaiting_approval?"warn":"") +
-      kv("Acquisitions", fmt(c.acquisitions)) + kv("Sync runs", fmt(c.sync_runs));
-    document.getElementById("sync").innerHTML = "<tr><th>#</th><th>When</th><th>Status</th><th>Added</th><th>Skipped</th></tr>" +
-      (syn.runs||[]).slice(0,8).map(r => `<tr><td>${r.id}</td><td>${(r.started_at||"").slice(0,16)}</td><td>${r.status}</td><td>${fmt(r.added)}</td><td>${fmt(r.skipped)}</td></tr>`).join("");
-    document.getElementById("downloads").innerHTML = "<tr><th>#</th><th>Release</th><th>Status</th></tr>" +
-      (dl.acquisitions||[]).slice(0,8).map(a => `<tr><td>${a.id}</td><td>${(a.title||"").slice(0,40)}</td><td>${a.status}</td></tr>`).join("");
-    document.getElementById("automation").innerHTML = "<tr><th>Job</th><th>Schedule</th><th>Last</th></tr>" +
-      (auto.jobs||[]).map(j => `<tr><td>${j.name}</td><td>${j.schedule}</td><td>${(j.last_run||"never").slice(0,16)}</td></tr>`).join("");
-    document.getElementById("stamp").textContent = "updated " + new Date().toLocaleTimeString();
+    const res = await fetch(url);
+    if (!res.ok) return { error: `HTTP ${res.status}` };
+    return await res.json();
   } catch (err) {
-    document.getElementById("stamp").textContent = "error: " + err.message;
+    return { error: err.message };
   }
 }
-refresh(); setInterval(refresh, 15000);
+
+async function refreshAll() {
+  document.getElementById("stamp").textContent = "refreshing…";
+
+  // Fetch all endpoints with fault isolation
+  const [s, lib, dev, syn, cands, auto] = await Promise.all([
+    safeFetch("/api/status"),
+    safeFetch("/api/library"),
+    safeFetch("/api/devices"),
+    safeFetch("/api/sync"),
+    safeFetch("/api/candidates?status=awaiting_approval"),
+    safeFetch("/api/automation")
+  ]);
+
+  // Library
+  if (lib && !lib.error) {
+    document.getElementById("library").innerHTML =
+      kv("Total Files", fmt(lib.files)) +
+      kv("Verified FLAC", fmt(lib.verified_flac), "ok") +
+      kv("Albums / Artists", fmt(lib.albums) + " / " + fmt(lib.artists)) +
+      kv("Disk Usage", gb(lib.size_bytes)) +
+      kv("Transcode Suspects", fmt(lib.transcode_suspect), lib.transcode_suspect ? "warn" : "");
+  }
+
+  // Spotify
+  if (s && !s.error && s.spotify) {
+    const sp = s.spotify;
+    const sc = sp.counts || {};
+    document.getElementById("spotify").innerHTML =
+      kv("Account Connected", sp.logged_in ? "Connected (PKCE)" : "Not Connected", sp.logged_in ? "ok" : "bad") +
+      kv("Saved Tracks", fmt(sc.saved_tracks)) +
+      kv("Playlists Indexed", fmt(sc.playlists)) +
+      kv("Taste Artists", fmt(sp.profile_artists)) +
+      kv("Last Spotify Sync", sp.last_sync || "never");
+  }
+
+  // Devices
+  if (dev && !dev.error) {
+    const volumes = dev.volumes || [];
+    const b = document.getElementById("card-badge");
+    if (volumes.length) {
+      const v = volumes[0];
+      b.textContent = v.confirmed ? "confirmed" : "unconfirmed";
+      b.className = "badge " + (v.confirmed ? "ok" : "warn");
+      document.getElementById("devices").innerHTML =
+        kv("Volume Name", v.volume_name) +
+        kv("Filesystem", v.filesystem + " (Echo Mini ready)") +
+        kv("Capacity", v.capacity_gb + " GB") +
+        kv("Mount Point", v.mount_point) +
+        kv("Target State", v.confirmed ? "Ready for Sync" : "Needs Confirmation", v.confirmed ? "ok" : "warn");
+    } else {
+      b.textContent = "offline";
+      b.className = "badge bad";
+      document.getElementById("devices").innerHTML = kv("Card", "No microSD card detected", "warn");
+    }
+  }
+
+  // Pipeline
+  if (s && !s.error && s.counts) {
+    const c = s.counts;
+    document.getElementById("pipeline").innerHTML =
+      kv("Total Candidates", fmt(c.candidates)) +
+      kv("Awaiting Review", fmt(c.awaiting_approval), c.awaiting_approval ? "warn" : "") +
+      kv("Approved Acquisitions", fmt(c.acquisitions)) +
+      kv("Total Sync Runs", fmt(c.sync_runs)) +
+      kv("Reserved Capacity", "1.50 GB (Protected)");
+  }
+
+  // Candidates Table
+  const candList = (cands && !cands.error) ? (cands.candidates || []) : [];
+  document.getElementById("cand-count").textContent = candList.length + " pending";
+  const candBody = document.getElementById("candidates-body");
+  if (!candList.length) {
+    candBody.innerHTML = `<tr><td colspan="7" class="empty-msg">No candidates awaiting review</td></tr>`;
+  } else {
+    candBody.innerHTML = candList.slice(0, 15).map(c => `
+      <tr>
+        <td><b>#${c.id}</b></td>
+        <td>${c.artist_name || "-"}</td>
+        <td><b>${c.release_title || c.entity_name || "-"}</b></td>
+        <td>${c.score ? c.score.toFixed(1) : "-"}</td>
+        <td><span class="badge ${c.licence ? "ok" : "warn"}">${c.licence || "unverified"}</span></td>
+        <td style="color:var(--muted); font-size:11px;">${(c.reasons || []).map(r => r.code || r.reason).join(", ")}</td>
+        <td>
+          <button class="btn-sm" style="color:var(--good);" onclick="approveCandidate(${c.id})">Approve</button>
+          <button class="btn-sm danger" onclick="rejectCandidate(${c.id})">Reject</button>
+        </td>
+      </tr>
+    `).join("");
+  }
+
+  // Sync Runs
+  if (syn && !syn.error) {
+    const runs = syn.runs || [];
+    const syncBody = document.getElementById("sync-body");
+    if (!runs.length) {
+      syncBody.innerHTML = `<tr><td colspan="5" class="empty-msg">No sync runs recorded</td></tr>`;
+    } else {
+      syncBody.innerHTML = runs.slice(0, 6).map(r => `
+        <tr>
+          <td>#${r.id}</td>
+          <td>${(r.started_at || "").slice(0, 16).replace("T", " ")}</td>
+          <td><span class="badge ${r.status==='completed'?'ok':'warn'}">${r.status}</span></td>
+          <td><b>${fmt(r.added)}</b></td>
+          <td>${fmt(r.skipped)}</td>
+        </tr>
+      `).join("");
+    }
+  }
+
+  // Automation
+  if (auto && !auto.error) {
+    const jobs = auto.jobs || [];
+    document.getElementById("auto-body").innerHTML = jobs.map(j => `
+      <tr>
+        <td><b>${j.name}</b></td>
+        <td>${j.schedule}</td>
+        <td>${j.last_run ? j.last_run.slice(0, 16).replace("T", " ") : "never"}</td>
+        <td><span class="badge ${j.due ? "warn" : "ok"}">${j.due ? "due" : "idle"}</span></td>
+      </tr>
+    `).join("");
+  }
+
+  document.getElementById("stamp").textContent = "updated " + new Date().toLocaleTimeString();
+}
+
+async function triggerScan(btn) {
+  btn.disabled = true;
+  showToast("Scanning library directories for audio files…");
+  try {
+    const res = await fetch("/api/actions/scan", { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      const s = data.summary;
+      showToast(`Scan complete: ${s.scanned} scanned, ${s.indexed} indexed, ${s.matched} matched to Spotify`);
+    } else {
+      showToast("Scan failed: " + (data.error || "unknown"), true);
+    }
+  } catch (err) {
+    showToast("Scan error: " + err.message, true);
+  } finally {
+    btn.disabled = false;
+    refreshAll();
+  }
+}
+
+async function triggerSync(btn, dryRun) {
+  btn.disabled = true;
+  showToast(dryRun ? "Calculating sync plan for microSD…" : "Syncing files to microSD card…");
+  try {
+    const res = await fetch(`/api/actions/sync?dry_run=${dryRun ? "true" : "false"}`, { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      if (dryRun) {
+        const p = data.plan;
+        showToast(`Sync Plan: ${p.add.length} to add, ${p.skip.length} unchanged, Fits: ${p.fits ? "YES" : "NO"} (${gb(p.planned_bytes)})`);
+      } else {
+        const r = data.result;
+        showToast(`Sync Complete! Added: ${r.added}, Verified: ${r.verified}, Skipped: ${r.skipped}`, false);
+      }
+    } else {
+      showToast("Sync failed: " + (data.error || "unknown"), true);
+    }
+  } catch (err) {
+    showToast("Sync error: " + err.message, true);
+  } finally {
+    btn.disabled = false;
+    refreshAll();
+  }
+}
+
+async function triggerSpotifySync(btn) {
+  btn.disabled = true;
+  showToast("Fetching latest saved tracks and playlists from Spotify…");
+  try {
+    const res = await fetch("/api/actions/spotify-sync", { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      showToast("Spotify synced successfully!");
+    } else {
+      showToast("Spotify sync failed: " + (data.error || "unknown"), true);
+    }
+  } catch (err) {
+    showToast("Error: " + err.message, true);
+  } finally {
+    btn.disabled = false;
+    refreshAll();
+  }
+}
+
+async function approveCandidate(id) {
+  showToast(`Approving candidate #${id}…`);
+  try {
+    const res = await fetch(`/api/actions/approve?candidate_id=${id}`, { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      showToast(`Candidate #${id} approved!`);
+    } else {
+      showToast("Could not approve: " + data.error, true);
+    }
+  } catch (err) {
+    showToast("Error: " + err.message, true);
+  } finally {
+    refreshAll();
+  }
+}
+
+async function rejectCandidate(id) {
+  showToast(`Rejecting candidate #${id}…`);
+  try {
+    const res = await fetch(`/api/actions/reject?candidate_id=${id}`, { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      showToast(`Candidate #${id} rejected.`);
+    } else {
+      showToast("Could not reject: " + data.error, true);
+    }
+  } catch (err) {
+    showToast("Error: " + err.message, true);
+  } finally {
+    refreshAll();
+  }
+}
+
+refreshAll();
+setInterval(refreshAll, 10000);
 </script>
-</body></html>
+</body>
+</html>
 """
