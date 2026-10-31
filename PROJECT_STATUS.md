@@ -36,8 +36,14 @@ Last Updated: 2026-11-01
   - Executed live, checksum-verified sync to `/Volumes/sandisk64/Music`.
   - Verified atomic `.part` staging, fsync, SHA-256 match, and atomic rename.
   - Verified incremental sync skip detection: identical card files are recognized and skipped (`Skip: 1, Add: 0`).
-  - Read-only dashboard running on `http://127.0.0.1:8765`.
+  - Read-only & interactive control dashboard running on `http://127.0.0.1:8765`.
+  - Added dedicated **Spotify Library & Playlists Browser** with tabs for:
+    - 📁 **Playlists (110)**: Fast name/curator filter, track counts, and interactive tracklist inspector modal showing track position, title, artist, album, length, and sync status.
+    - ❤️ **Liked Songs (372)**: Filterable and paginated user saved tracks.
+    - 🎵 **All Songs (2,028)**: Complete searchable library song index with pagination and card sync status.
+  - Global live search integrated with instant playlist, song, artist, and candidate discovery.
   - Full test suite verified: 24 passed, 1 skipped (optional libtorrent), 0 failed.
 
 ### Blockers
 - None. System is fully operational and syncing successfully.
+
