@@ -180,7 +180,12 @@ def status(ctx: typer.Context) -> None:
     spotify["profile_artists"] = len(profile.get("artists") or [])
 
     try:
-        volumes = [volume.as_dict() for volume in DeviceLocator(config).candidates()]
+        planner = SyncPlanner(config, db)
+        candidates = DeviceLocator(config).candidates()
+        volumes = [
+            {**volume.as_dict(), "confirmed": planner.is_confirmed(volume)}
+            for volume in candidates
+        ]
         device_error = None
     except DeviceError as exc:
         volumes = []

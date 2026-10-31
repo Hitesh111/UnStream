@@ -8,13 +8,16 @@
 - [x] Create project tracking docs (`PROJECT_STATUS.md`, `TECHNICAL_DECISIONS.md`, `TODO.md`).
 - [x] Run and pass test suite (24 tests passed).
 
-## Phase 2: Configuration & Device Detection
-- [ ] Initialize configuration via `musicctl init` (or generate custom test config).
-- [ ] Test read-only device detection CLI command: `musicctl device detect`.
-- [ ] Verify non-destructive dry-run behaviors across all commands.
+## Phase 2: Configuration & Device Confirmation [COMPLETED]
+- [x] Initialize configuration, directory structures, and database via `musicctl init`.
+- [x] Inspect and register target microSD device (`sandisk64`, ExFAT).
+- [x] Confirm microSD volume (`musicctl device confirm --device sandisk64`).
+- [x] Fix status command confirmation check to display device registration accurately.
+- [x] Test non-destructive dry-run sync planner (`musicctl sync --dry-run`).
+- [x] Verify report generation (`musicctl report`) and discovery source listing.
 
 ## Phase 3: Spotify Integration & Taste Profile
-- [ ] Prompt user for Spotify Developer App Client ID.
+- [ ] Receive Spotify Developer App Client ID from user.
 - [ ] Authenticate via PKCE flow (`musicctl spotify login`).
 - [ ] Perform incremental library and playlist fetch (`musicctl spotify sync`).
 - [ ] Generate taste profile scoring and genre mapping (`musicctl spotify profile`).
