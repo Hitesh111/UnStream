@@ -627,6 +627,45 @@ def downloads_status(ctx: typer.Context) -> None:
     ))
 
 
+@app.command("download")
+def download_cmd(
+    ctx: typer.Context,
+    track: int = typer.Option(None, "--track", "-t", help="Track ID to download"),
+    playlist: int = typer.Option(None, "--playlist", "-p", help="Playlist ID to download"),
+    saved: bool = typer.Option(False, "--saved", "-s", help="Download top saved/liked tracks"),
+    limit: int = typer.Option(20, "--limit", "-l", help="Limit number of tracks for playlist/saved"),
+) -> None:
+    """Download audio tracks, tag with Vorbis comments, validate, and organise for Echo Mini."""
+    from fiiolib.downloads.downloader import (
+        download_playlist,
+        download_saved_tracks,
+        download_track,
+    )
+
+    state = get_state(ctx)
+    if track:
+        console.print(f"[cyan]Downloading track #{track}…[/cyan]")
+        res = download_track(state.config, state.db, track)
+        if res.get("ok"):
+            ok(f"Downloaded '{res.get('title')}' by {res.get('artist')} -> {res.get('path')}")
+        else:
+            fail(f"Download failed: {res.get('error')}")
+    elif playlist:
+        console.print(f"[cyan]Downloading playlist #{playlist} (up to {limit} tracks)…[/cyan]")
+        res = download_playlist(state.config, state.db, playlist, max_tracks=limit)
+        ok(
+            f"Playlist download complete: {res['downloaded']} downloaded, {res['skipped']} skipped, {len(res['errors'])} errors"
+        )
+    elif saved:
+        console.print(f"[cyan]Downloading top {limit} liked songs…[/cyan]")
+        res = download_saved_tracks(state.config, state.db, limit=limit)
+        ok(
+            f"Liked songs complete: {res['downloaded']} downloaded, {res['skipped']} skipped, {len(res['errors'])} errors"
+        )
+    else:
+        fail("Specify --track <id>, --playlist <id>, or --saved")
+
+
 # ------------------------------------------------------------------ library
 @app.command()
 def scan(

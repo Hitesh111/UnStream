@@ -356,6 +356,21 @@ def create_app(config: Config, db: Database) -> FastAPI:
                 results.append({"id": cid, "ok": False, "error": str(exc)})
         return {"ok": True, "count": len(results), "results": results}
 
+    @app.post("/api/actions/download-track")
+    def action_download_track(track_id: int = Query(...)) -> dict[str, Any]:
+        from fiiolib.downloads.downloader import download_track
+        return download_track(config, db, track_id)
+
+    @app.post("/api/actions/download-playlist")
+    def action_download_playlist(playlist_id: int = Query(...), max_tracks: int = Query(default=30)) -> dict[str, Any]:
+        from fiiolib.downloads.downloader import download_playlist
+        return download_playlist(config, db, playlist_id, max_tracks=max_tracks)
+
+    @app.post("/api/actions/download-saved")
+    def action_download_saved(limit: int = Query(default=20)) -> dict[str, Any]:
+        from fiiolib.downloads.downloader import download_saved_tracks
+        return download_saved_tracks(config, db, limit=limit)
+
     @app.post("/api/actions/spotify-sync")
     def action_spotify_sync() -> dict[str, Any]:
         auth = SpotifyAuth(config, db)
@@ -796,6 +811,7 @@ input[type="checkbox"] { cursor: pointer; }
       <div style="margin-bottom: 10px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
         <span id="songs-count-label" style="color:var(--muted); font-size:11px;">Showing songs from your library</span>
         <div style="display:flex; align-items:center; gap:8px;">
+          <button class="btn-sm primary" id="btn-dl-saved-batch" onclick="downloadSavedBatch(this)" style="display:none;">⬇ Download Top 20 Liked Songs</button>
           <button class="btn-sm" id="btn-song-prev" onclick="changeSongPage(-1)" disabled>◀ Previous</button>
           <span id="song-page-indicator" style="font-size:11px; color:var(--muted); font-variant-numeric:tabular-nums;">Page 1 of 1</span>
           <button class="btn-sm" id="btn-song-next" onclick="changeSongPage(1)" disabled>Next ▶</button>
@@ -811,10 +827,11 @@ input[type="checkbox"] { cursor: pointer; }
               <th>Album</th>
               <th style="text-align:right;">Length</th>
               <th>FiiO Card State</th>
+              <th style="width: 110px;">Action</th>
             </tr>
           </thead>
           <tbody id="songs-body">
-            <tr><td colspan="6" class="empty-msg">Loading songs…</td></tr>
+            <tr><td colspan="7" class="empty-msg">Loading songs…</td></tr>
           </tbody>
         </table>
       </div>
@@ -883,7 +900,10 @@ input[type="checkbox"] { cursor: pointer; }
         <h3 id="modal-pl-title" style="margin:0; font-size:15px; font-weight:600; color:#fff;">Playlist Title</h3>
         <span id="modal-pl-subtitle" style="font-size:11px; color:var(--muted);">Curator • Total Tracks</span>
       </div>
-      <button class="btn-sm" onclick="closePlaylistModal()">✕ Close</button>
+      <div style="display:flex; align-items:center; gap:10px;">
+        <button class="btn-sm primary" id="btn-modal-dl-all" onclick="downloadCurrentPlaylist(this)">⬇ Download Playlist</button>
+        <button class="btn-sm" onclick="closePlaylistModal()">✕ Close</button>
+      </div>
     </div>
     <div style="padding:14px 20px; overflow-y:auto; flex:1;">
       <table id="modal-pl-table">
@@ -895,10 +915,11 @@ input[type="checkbox"] { cursor: pointer; }
             <th>Album</th>
             <th style="text-align:right;">Length</th>
             <th>FiiO Echo Mini State</th>
+            <th style="width:110px;">Action</th>
           </tr>
         </thead>
         <tbody id="modal-pl-body">
-          <tr><td colspan="6" class="empty-msg">Loading tracks…</td></tr>
+          <tr><td colspan="7" class="empty-msg">Loading tracks…</td></tr>
         </tbody>
       </table>
     </div>
@@ -1070,17 +1091,20 @@ async function switchBrowserTab(tab) {
   const plView = document.getElementById("tab-view-playlists");
   const songsView = document.getElementById("tab-view-songs");
   const filterInput = document.getElementById("browser-filter-input");
+  const btnDlSaved = document.getElementById("btn-dl-saved-batch");
   filterInput.value = "";
   songFilterQuery = "";
 
   if (tab === "playlists") {
     plView.style.display = "block";
     songsView.style.display = "none";
+    if (btnDlSaved) btnDlSaved.style.display = "none";
     filterInput.placeholder = "Filter playlists by name or curator…";
     loadPlaylists();
   } else if (tab === "saved") {
     plView.style.display = "none";
     songsView.style.display = "block";
+    if (btnDlSaved) btnDlSaved.style.display = "inline-flex";
     filterInput.placeholder = "Filter liked songs…";
     document.getElementById("songs-count-label").textContent = "Showing Spotify Liked Songs";
     currentSongPage = 1;
@@ -1088,6 +1112,7 @@ async function switchBrowserTab(tab) {
   } else if (tab === "all_songs") {
     plView.style.display = "none";
     songsView.style.display = "block";
+    if (btnDlSaved) btnDlSaved.style.display = "none";
     filterInput.placeholder = "Filter all songs by title, artist, or album…";
     document.getElementById("songs-count-label").textContent = "Showing All Library Songs";
     currentSongPage = 1;
@@ -1132,7 +1157,7 @@ async function loadSongs() {
   const q = songFilterQuery;
   const data = await safeFetch(`/api/songs?category=${category}&q=${encodeURIComponent(q)}&page=${currentSongPage}&page_size=50`);
   if (!data || data.error) {
-    tbody.innerHTML = `<tr><td colspan="6" class="empty-msg">Error loading songs: ${data ? data.error : "network"}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="7" class="empty-msg">Error loading songs: ${data ? data.error : "network"}</td></tr>`;
     return;
   }
   const songs = data.songs || [];
@@ -1150,7 +1175,7 @@ async function loadSongs() {
   }
 
   if (!songs.length) {
-    tbody.innerHTML = `<tr><td colspan="6" class="empty-msg">No songs found matching query</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="7" class="empty-msg">No songs found matching query</td></tr>`;
     return;
   }
 
@@ -1162,7 +1187,10 @@ async function loadSongs() {
       <td>${s.artist_name}</td>
       <td>${s.album_title}</td>
       <td style="text-align:right;">${msToMin(s.duration_ms)}</td>
-      <td>${s.validated ? '<span class="badge ok">✓ Synced to Card</span>' : (s.path ? '<span class="badge sync">Local Matched</span>' : '<span class="badge">Spotify Cloud</span>')}</td>
+      <td>${s.validated ? '<span class="badge ok">✓ On Disk / Ready</span>' : (s.path ? '<span class="badge sync">Local Matched</span>' : '<span class="badge">Spotify Cloud</span>')}</td>
+      <td>
+        ${s.validated ? '<span class="badge ok">✓ Ready</span>' : `<button class="btn-sm" onclick="downloadSongRow(${s.id}, this)">⬇ Download</button>`}
+      </td>
     </tr>
   `).join("");
 }
@@ -1188,7 +1216,10 @@ function onBrowserFilter(val) {
   }, 250);
 }
 
+let currentOpenPlaylistId = null;
+
 async function openPlaylist(id) {
+  currentOpenPlaylistId = id;
   const modal = document.getElementById("playlist-modal");
   const title = document.getElementById("modal-pl-title");
   const subtitle = document.getElementById("modal-pl-subtitle");
@@ -1197,12 +1228,12 @@ async function openPlaylist(id) {
   modal.style.display = "flex";
   title.textContent = "Loading playlist…";
   subtitle.textContent = "";
-  tbody.innerHTML = `<tr><td colspan="6" class="empty-msg">Fetching tracks from database…</td></tr>`;
+  tbody.innerHTML = `<tr><td colspan="7" class="empty-msg">Fetching tracks from database…</td></tr>`;
 
   const data = await safeFetch(`/api/playlists/${id}/tracks`);
   if (!data || data.error) {
     title.textContent = "Playlist Error";
-    tbody.innerHTML = `<tr><td colspan="6" class="empty-msg">${data ? data.error : "Failed to load"}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="7" class="empty-msg">${data ? data.error : "Failed to load"}</td></tr>`;
     return;
   }
 
@@ -1212,7 +1243,7 @@ async function openPlaylist(id) {
 
   const tracks = data.tracks || [];
   if (!tracks.length) {
-    tbody.innerHTML = `<tr><td colspan="6" class="empty-msg">No tracks indexed for this playlist yet (Spotify Web API 2026 Developer restriction on non-collaborative third-party playlists).</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="7" class="empty-msg">No tracks indexed for this playlist yet (Spotify Web API 2026 Developer restriction on non-collaborative third-party playlists).</td></tr>`;
     return;
   }
 
@@ -1223,9 +1254,96 @@ async function openPlaylist(id) {
       <td>${t.artist_name}</td>
       <td>${t.album_title}</td>
       <td style="text-align:right;">${msToMin(t.duration_ms)}</td>
-      <td>${t.validated ? '<span class="badge ok">✓ Synced to Card</span>' : (t.path ? '<span class="badge sync">Local Matched</span>' : '<span class="badge">Spotify Cloud Track</span>')}</td>
+      <td>${t.validated ? '<span class="badge ok">✓ On Disk / Ready</span>' : (t.path ? '<span class="badge sync">Local Matched</span>' : '<span class="badge">Spotify Cloud Track</span>')}</td>
+      <td>
+        ${t.validated ? '<span class="badge ok">✓ Ready</span>' : `<button class="btn-sm" onclick="downloadSongRow(${t.id}, this)">⬇ Download</button>`}
+      </td>
     </tr>
   `).join("");
+}
+
+async function downloadSongRow(trackId, btn) {
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "⏳ Downloading…";
+  }
+  showToast(`Downloading track #${trackId} via yt-dlp & FFmpeg…`);
+  try {
+    const res = await fetch(`/api/actions/download-track?track_id=${trackId}`, { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      showToast(`Downloaded "${data.title}" by ${data.artist}! Validated and ready to sync.`);
+      if (btn) {
+        btn.outerHTML = '<span class="badge ok">✓ Ready</span>';
+      }
+      refreshAll();
+    } else {
+      showToast("Download failed: " + (data.error || "error"), true);
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "⬇ Retry";
+      }
+    }
+  } catch (err) {
+    showToast("Error: " + err.message, true);
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "⬇ Retry";
+    }
+  }
+}
+
+async function downloadCurrentPlaylist(btn) {
+  if (!currentOpenPlaylistId) return;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "⏳ Downloading…";
+  }
+  showToast("Downloading playlist songs in background…");
+  try {
+    const res = await fetch(`/api/actions/download-playlist?playlist_id=${currentOpenPlaylistId}&max_tracks=30`, { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      showToast(`Playlist downloaded: ${data.downloaded} new tracks, ${data.skipped} already present!`);
+      openPlaylist(currentOpenPlaylistId);
+      refreshAll();
+    } else {
+      showToast("Playlist download error: " + (data.error || "failed"), true);
+    }
+  } catch (err) {
+    showToast("Error: " + err.message, true);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "⬇ Download Playlist";
+    }
+  }
+}
+
+async function downloadSavedBatch(btn) {
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "⏳ Downloading…";
+  }
+  showToast("Downloading your top Liked Songs…");
+  try {
+    const res = await fetch("/api/actions/download-saved?limit=20", { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      showToast(`Liked songs complete: ${data.downloaded} new tracks downloaded, ${data.skipped} already present!`);
+      loadSongs();
+      refreshAll();
+    } else {
+      showToast("Download error: " + (data.error || "failed"), true);
+    }
+  } catch (err) {
+    showToast("Error: " + err.message, true);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "⬇ Download Top 20 Liked Songs";
+    }
+  }
 }
 
 function closePlaylistModal() {

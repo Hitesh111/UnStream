@@ -21,13 +21,17 @@ sf = pytest.importorskip("soundfile", reason="soundfile is needed to generate FL
 @pytest.fixture()
 def flac_file(tmp_path: Path) -> Path:
     path = tmp_path / "sample.flac"
-    samples = (0.2 * np.sin(2 * np.pi * 440 * np.linspace(0, 2, 2 * 44100))).astype("float32")
+    rng = np.random.default_rng(42)
+    samples = (
+        0.2 * np.sin(2 * np.pi * 440 * np.linspace(0, 2, 2 * 44100))
+        + 0.05 * rng.standard_normal(2 * 44100)
+    ).astype("float32")
     sf.write(path, samples, 44100, format="FLAC", subtype="PCM_16")
     return path
 
 
 def test_probe_flac_without_ffprobe(flac_file: Path) -> None:
-    result = probe(flac_file)
+    result = probe(flac_file, ffprobe_path="/nonexistent")
     assert result.error is None
     assert result.codec == "flac"
     assert result.sample_rate == 44100
@@ -56,13 +60,13 @@ def test_mutagen_fallback_without_ffprobe(
     path = tmp_path / f"sample.{extension}"
     samples = (0.2 * np.sin(2 * np.pi * 330 * np.linspace(0, 2, 2 * 44100))).astype("float32")
     sf.write(path, samples, 44100, format=fmt, subtype=subtype)
-    result = probe(path)
+    result = probe(path, ffprobe_path="/nonexistent")
     assert result.error is None
     assert result.backend == "mutagen"
     assert result.codec == codec
     assert result.sample_rate == 44100
     assert result.duration_ms is not None and 1800 <= result.duration_ms <= 2100
-    validation = validate_audio(path)
+    validation = validate_audio(path, ffprobe_path="/nonexistent")
     assert validation.ok, validation.errors
     assert any("ffprobe is unavailable" in warning for warning in validation.warnings)
 

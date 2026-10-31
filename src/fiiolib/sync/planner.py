@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import subprocess
+import sys
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -315,6 +317,20 @@ class SyncPlanner:
 
         if not dry_run and not result["errors"]:
             result["albums_synced"] = self._mark_albums_synced(plan)
+            # macOS automatically creates AppleDouble ._* files on FAT/exFAT volumes,
+            # which confuse the Echo Mini display. Clean them automatically after sync.
+            if sys.platform == "darwin" and shutil.which("dot_clean"):
+                try:
+                    music_dir = plan.device.mount_point / "Music"
+                    if music_dir.exists():
+                        subprocess.run(
+                            ["dot_clean", "-m", str(music_dir)],
+                            capture_output=True,
+                            check=False,
+                            timeout=30,
+                        )
+                except Exception:
+                    pass
         self.db.execute(
             "UPDATE sync_runs SET finished_at = ?, status = ?, added = ?, updated = ?, skipped = ?, "
             "copied_bytes = ?, errors = ? WHERE id = ?",
