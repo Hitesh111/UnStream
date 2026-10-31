@@ -50,6 +50,13 @@ Last Updated: 2026-11-01
   - Added CLI `musicctl download --track <id>`, `--playlist <id>`, and `--saved [--limit <n>]`.
   - Added automated macOS `dot_clean -m` execution directly in `fiiolib.sync.planner.execute()` to strip and merge all AppleDouble `._*` resource fork files upon writing to the microSD card.
   - Successfully downloaded, validated, organised, and live-synced 6 FLAC tracks to `/Volumes/sandisk64/Music`.
+- **Phase 8: On-Screen Live Activity, Execution & Failure Monitor**:
+  - Implemented thread-safe [`ActivityLogger`](file:///Users/hiteshkumar/local_music/src/fiiolib/activity.py) ring buffer and execution state monitor.
+  - Added dedicated **Live Activity & Execution Monitor** section to the web dashboard at `http://127.0.0.1:8765`.
+  - Added live terminal console with timestamped, categorized entries for `[SYNC]`, `[DOWNLOAD]`, `[TRANSCODE]`, `[VALIDATE]`, and `[SYSTEM]`.
+  - Added active task progress bar displaying currently active track, ratio (e.g. `3 / 10`), and percentage.
+  - Added dedicated **Failed Tracks Alert & Retry Box**: highlights failing tracks with title, artist, exact error message, and a 1-click **⬇ Retry Download** button.
+  - Real-time polling with smooth auto-scroll toggle and console clear controls.
 
 ### Current Card State (/Volumes/sandisk64)
 - **Files Synced**: 6 FLAC tracks (Bappi Lahiri, Suleymer, Television Blonde, Minaxi, Adriano Celentano, Lorie Ladd).
