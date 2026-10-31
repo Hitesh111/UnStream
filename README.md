@@ -1,9 +1,9 @@
-# FiiO Library Manager
+# UnStream
 
-A local, macOS-first music library manager for a **FiiO SNOWSKY Echo Mini**:
+> **Stop streaming. Start listening.**
+> A local, lossless music library manager & offline sync engine for portable DAPs (FiiO Echo Mini).
 
-- Reads your Spotify library, playlists, follows, and listening history to build a
-  **taste profile**.
+- Unstreams your Spotify library, playlists, liked tracks, and listening history into a local FLAC catalog.
 - Finds **additional releases** from MusicBrainz, Internet Archive, and the taste
   profile itself, with a reason code for every candidate.
 - Only auto-approves releases whose **licence/authorisation is explicit**
