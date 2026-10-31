@@ -474,15 +474,29 @@ def _safe_year(release_date: str | None) -> int | None:
         return None
 
 
-def candidate_rows(db: Database, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+def candidate_rows(
+    db: Database,
+    status: str | None = None,
+    limit: int = 100,
+    query: str | None = None,
+) -> list[dict[str, Any]]:
     sql = (
-        "SELECT c.*, ar.name AS artist_name FROM discovery_candidates c "
-        "LEFT JOIN artists ar ON ar.id = c.artist_id"
+        "SELECT c.*, ar.name AS artist_name, al.cover_url, al.release_year "
+        "FROM discovery_candidates c "
+        "LEFT JOIN artists ar ON ar.id = c.artist_id "
+        "LEFT JOIN albums al ON al.id = c.album_id"
     )
+    clauses: list[str] = []
     params: list[Any] = []
-    if status:
-        sql += " WHERE c.status = ?"
+    if status and status.lower() not in ("all", "any", ""):
+        clauses.append("c.status = ?")
         params.append(status)
+    if query and query.strip():
+        q_wild = f"%{query.strip()}%"
+        clauses.append("(c.entity_name LIKE ? OR ar.name LIKE ? OR c.reasons LIKE ?)")
+        params.extend([q_wild, q_wild, q_wild])
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
     sql += " ORDER BY c.score DESC LIMIT ?"
     params.append(limit)
     rows = []

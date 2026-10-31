@@ -198,7 +198,7 @@ class SpotifyClient:
                 f"/artists/{artist_id}/albums",
                 params={
                     "include_groups": "album,single,compilation",
-                    "limit": min(limit, 50),
+                    "limit": min(limit, 10),
                 },
                 max_items=limit,
                 allow_unavailable=True,

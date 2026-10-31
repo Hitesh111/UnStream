@@ -26,7 +26,7 @@ from fiiolib.sync.planner import SyncPlanner
 
 logger = logging.getLogger(__name__)
 
-ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
+ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1", "testclient"}
 
 
 def create_app(config: Config, db: Database) -> FastAPI:
@@ -59,9 +59,21 @@ def create_app(config: Config, db: Database) -> FastAPI:
         return report_payload(config, db)
 
     @app.get("/api/candidates")
-    def candidates(status_filter: str | None = Query(default=None, alias="status"), limit: int = 100) -> dict[str, Any]:
-        rows = candidate_rows(db, status=status_filter, limit=min(limit, 500))
-        return {"count": len(rows), "candidates": rows}
+    def candidates(
+        status_filter: str | None = Query(default=None, alias="status"),
+        limit: int = 200,
+        q: str = Query(default=""),
+    ) -> dict[str, Any]:
+        rows = candidate_rows(db, status=status_filter, limit=min(limit, 500), query=q)
+        counts = {
+            "all": int(db.scalar("SELECT COUNT(*) FROM discovery_candidates") or 0),
+            "awaiting_approval": int(
+                db.scalar("SELECT COUNT(*) FROM discovery_candidates WHERE status = 'awaiting_approval'") or 0
+            ),
+            "approved": int(db.scalar("SELECT COUNT(*) FROM discovery_candidates WHERE status = 'approved'") or 0),
+            "rejected": int(db.scalar("SELECT COUNT(*) FROM discovery_candidates WHERE status = 'rejected'") or 0),
+        }
+        return {"count": len(rows), "candidates": rows, "counts": counts}
 
     @app.get("/api/devices")
     def devices() -> dict[str, Any]:
@@ -477,6 +489,133 @@ def create_app(config: Config, db: Database) -> FastAPI:
         finally:
             client.close()
 
+    @app.post("/api/actions/discover")
+    def action_discover(limit_artists: int = Query(default=10)) -> dict[str, Any]:
+        from fiiolib.activity import activity
+        from fiiolib.discovery.engine import DiscoveryEngine
+        activity.start_operation("discovery", "Discovering new music from Spotify, MusicBrainz & Archive", total=limit_artists)
+        activity.log(level="info", category="discovery", message="Starting discovery engine scan across authorised sources…")
+
+        auth = SpotifyAuth(config, db)
+        spotify = SpotifyClient(config, db, auth=auth) if auth.is_logged_in() else None
+        engine = DiscoveryEngine(config, db, spotify=spotify)
+        try:
+            summary = engine.run(
+                limit_artists=limit_artists,
+                use_spotify=spotify is not None,
+                use_musicbrainz=True,
+                use_internet_archive=True,
+            )
+            data = summary.as_dict()
+            total_cand = int(db.scalar("SELECT COUNT(*) FROM discovery_candidates") or 0)
+            pending_cand = int(
+                db.scalar("SELECT COUNT(*) FROM discovery_candidates WHERE status = 'awaiting_approval'") or 0
+            )
+            activity.finish_operation(
+                f"Discovery complete: {data.get('albums', 0)} new candidate albums found ({pending_cand} awaiting review)"
+            )
+            activity.log(
+                level="success",
+                category="discovery",
+                message=f"✓ Discovery complete: found {data.get('albums', 0)} unowned releases. Pending review: {pending_cand}.",
+            )
+            return {"ok": True, "summary": data, "total_candidates": total_cand, "pending": pending_cand}
+        except Exception as exc:
+            logger.exception("Discovery failed")
+            activity.finish_operation("Discovery scan failed")
+            activity.log(level="error", category="discovery", message=f"Discovery scan failed: {exc}", error=str(exc))
+            return {"ok": False, "error": str(exc)}
+        finally:
+            engine.close()
+            if spotify:
+                spotify.close()
+
+    @app.get("/api/discovery/explore")
+    def discovery_explore(q: str = Query(default="")) -> dict[str, Any]:
+        """Search Spotify or MusicBrainz for new discoverable music with track details."""
+        if not q or len(q.strip()) < 2:
+            return {"query": "", "results": []}
+        auth = SpotifyAuth(config, db)
+        results: list[dict[str, Any]] = []
+        if auth.is_logged_in():
+            client = SpotifyClient(config, db, auth=auth)
+            try:
+                res = client.search(q.strip(), types=("track", "album"), limit=10)
+                tracks = res.get("tracks", {}).get("items") or []
+                for t in tracks:
+                    artists = t.get("artists") or []
+                    artist_name = artists[0].get("name") if artists else "Unknown"
+                    album = t.get("album") or {}
+                    album_title = album.get("name") or "Single"
+                    cover = (album.get("images") or [{}])[0].get("url") if album.get("images") else None
+                    in_db = db.one(
+                        "SELECT t.id, f.validated FROM tracks t LEFT JOIN files f ON f.track_id = t.id WHERE t.title = ? LIMIT 1",
+                        (t.get("name"),),
+                    )
+                    results.append(
+                        {
+                            "spotify_id": t.get("id"),
+                            "title": t.get("name"),
+                            "artist_name": artist_name,
+                            "album_title": album_title,
+                            "duration_ms": t.get("duration_ms"),
+                            "cover_url": cover,
+                            "release_date": album.get("release_date"),
+                            "in_library": bool(in_db),
+                            "is_ready": bool(in_db and in_db["validated"]),
+                            "db_track_id": in_db["id"] if in_db else None,
+                        }
+                    )
+            except Exception as exc:
+                logger.warning("Discovery explore search failed: %s", exc)
+            finally:
+                client.close()
+        return {"query": q, "results": results}
+
+    @app.post("/api/actions/download-candidate")
+    def action_download_candidate(candidate_id: int = Query(...)) -> dict[str, Any]:
+        """Download candidate release directly to FLAC."""
+        cand = db.one(
+            "SELECT c.*, a.name AS artist_name FROM discovery_candidates c "
+            "LEFT JOIN artists a ON a.id = c.artist_id WHERE c.id = ?",
+            (candidate_id,),
+        )
+        if not cand:
+            return {"ok": False, "error": f"Candidate {candidate_id} not found"}
+
+        repo.set_candidate_status(db, candidate_id, "approved")
+        title = cand["entity_name"]
+        artist = cand["artist_name"] or "Unknown"
+
+        artist_id = cand["artist_id"] or repo.get_or_create_artist(db, artist)
+        album_id = cand["album_id"] or repo.get_or_create_album(db, title, artist_id=artist_id)
+        track_id = repo.get_or_create_track(db, title, artist_id=artist_id, album_id=album_id)
+
+        from fiiolib.downloads.downloader import download_track, export_all_playlists
+        res = download_track(config, db, track_id)
+        if res.get("ok"):
+            export_all_playlists(config, db)
+        return res
+
+    @app.post("/api/actions/download-explore-track")
+    def action_download_explore_track(
+        title: str = Query(...),
+        artist: str = Query(...),
+        album: str = Query(default="Single"),
+        spotify_id: str | None = Query(default=None),
+        cover_url: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        """Directly acquire any newly discovered track into library in FLAC."""
+        artist_id = repo.get_or_create_artist(db, artist)
+        album_id = repo.get_or_create_album(db, album, artist_id=artist_id, cover_url=cover_url)
+        track_id = repo.get_or_create_track(db, title, artist_id=artist_id, album_id=album_id, spotify_id=spotify_id)
+
+        from fiiolib.downloads.downloader import download_track, export_all_playlists
+        res = download_track(config, db, track_id)
+        if res.get("ok"):
+            export_all_playlists(config, db)
+        return res
+
     @app.get("/api/activity")
     def get_activity_logs(since_id: int = Query(default=0)) -> dict[str, Any]:
         from fiiolib.activity import activity
@@ -879,6 +1018,26 @@ input[type="checkbox"] { cursor: pointer; }
   gap: 12px;
   flex-wrap: wrap;
 }
+.cand-cover {
+  width: 32px;
+  height: 32px;
+  border-radius: 3px;
+  object-fit: cover;
+  background: #141c2b;
+  display: inline-block;
+  vertical-align: middle;
+}
+.explore-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: #0d131e;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  gap: 12px;
+  font-size: 12px;
+}
 </style>
 </head>
 <body>
@@ -996,6 +1155,7 @@ input[type="checkbox"] { cursor: pointer; }
           <button class="tab-btn" id="tab-btn-saved" onclick="switchBrowserTab('saved')">Liked Songs (<span id="saved-tab-count">372</span>)</button>
           <button class="tab-btn" id="tab-btn-all_songs" onclick="switchBrowserTab('all_songs')">All Songs (<span id="all-songs-tab-count">2,028</span>)</button>
           <button class="tab-btn" id="tab-btn-downloaded" onclick="switchBrowserTab('downloaded')">Downloaded Local (<span id="downloaded-tab-count">6</span>)</button>
+          <button class="tab-btn" id="tab-btn-discovery" onclick="switchBrowserTab('discovery')">✨ Discover New Music (<span id="discovery-tab-count">0</span>)</button>
         </div>
       </div>
       <div class="sec-head-actions">
@@ -1111,40 +1271,67 @@ input[type="checkbox"] { cursor: pointer; }
         </table>
       </div>
     </div>
-  </section>
 
-  <!-- Candidates with Multi-Select and Bulk Actions -->
-  <section class="full-width">
-    <div class="sec-head">
-      <div>
-        <h2>Discovery Candidates (Awaiting Review)</h2>
-        <span class="badge warn" id="cand-count">0 pending</span>
-        <span id="selection-counter" style="margin-left: 8px; font-size: 11px; color: var(--accent); font-weight: 500;"></span>
+    <!-- Discovery View (Explore & Unowned Candidates) -->
+    <div id="tab-view-discovery" style="display:none;">
+      <!-- Discovery Action Toolbar & Status Filters -->
+      <div style="margin-bottom: 12px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+          <span style="font-size:11px; color:var(--muted); font-weight:600; text-transform:uppercase; letter-spacing:0.5px;">Filter:</span>
+          <button class="btn-sm active" id="btn-cand-filter-awaiting" onclick="setCandidateFilter('awaiting_approval')">Pending Review (<span id="count-cand-pending">0</span>)</button>
+          <button class="btn-sm" id="btn-cand-filter-all" onclick="setCandidateFilter('all')">All Unowned (<span id="count-cand-all">0</span>)</button>
+          <button class="btn-sm" id="btn-cand-filter-approved" onclick="setCandidateFilter('approved')">Approved (<span id="count-cand-approved">0</span>)</button>
+          <button class="btn-sm" id="btn-cand-filter-rejected" onclick="setCandidateFilter('rejected')">Rejected (<span id="count-cand-rejected">0</span>)</button>
+        </div>
+        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+          <span id="selection-counter" style="font-size: 11px; color: var(--accent); font-weight: 600;"></span>
+          <button class="btn-sm success" id="btn-approve-selected" onclick="approveSelected()" disabled>✓ Approve Selected</button>
+          <button class="btn-sm danger" id="btn-reject-selected" onclick="rejectSelected()" disabled>✕ Reject</button>
+          <button class="btn-sm" onclick="approveAllPending()">✓ Approve All Pending</button>
+          <button class="btn-sm primary" id="btn-run-discovery" onclick="runDiscoveryScan(this)">⚡ Scan For New Music</button>
+        </div>
       </div>
-      <div class="sec-head-actions">
-        <button class="btn-sm success" id="btn-approve-selected" onclick="approveSelected()" disabled>✓ Approve Selected</button>
-        <button class="btn-sm danger" id="btn-reject-selected" onclick="rejectSelected()" disabled>✕ Reject Selected</button>
-        <button class="btn-sm primary" onclick="approveAllPending()">✓ Approve All Pending</button>
+
+      <!-- Interactive Live Music Explorer Search Box -->
+      <div style="background:#090e17; border:1px solid var(--line); border-radius:6px; padding:12px 14px; margin-bottom:14px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; flex-wrap:wrap; gap:8px;">
+          <div style="display:flex; align-items:center; gap:8px;">
+            <span style="font-size:12px; font-weight:600; color:var(--fg);">🔎 Live Artist & Genre Explorer</span>
+            <span style="font-size:11px; color:var(--muted);">Search Spotify & public sources to preview & download unowned tracks in FLAC</span>
+          </div>
+          <span style="font-size:11px; color:var(--muted);">Press Enter or click Explore</span>
+        </div>
+        <div style="display:flex; gap:8px;">
+          <input type="text" id="explore-input" placeholder="Search any artist, subgenre, or mood (e.g. Khruangbin, Krautrock, Bappi Lahiri, Synthwave, Post-Rock)…" onkeydown="if(event.key==='Enter') runExploreSearch()" style="background:#04070c; border:1px solid var(--line); border-radius:4px; padding:7px 12px; font-size:12px; color:#fff; flex:1; outline:none;">
+          <button class="btn-sm primary" id="btn-explore-search" onclick="runExploreSearch()">Explore</button>
+        </div>
+        <div id="explore-results-box" style="display:none; margin-top:12px; max-height:280px; overflow-y:auto; border-top:1px solid var(--line); padding-top:10px;">
+          <div id="explore-results-list" style="display:flex; flex-direction:column; gap:6px;"></div>
+        </div>
       </div>
-    </div>
-    <div style="overflow-x:auto;">
-      <table id="candidates-table">
-        <thead>
-          <tr>
-            <th style="width: 32px;"><input type="checkbox" id="select-all-cands" onchange="toggleSelectAll(this)"></th>
-            <th style="width: 50px;">#</th>
-            <th>Artist</th>
-            <th>Release</th>
-            <th>Score</th>
-            <th>Licence Rights</th>
-            <th>Reason</th>
-            <th style="width: 140px;">Action</th>
-          </tr>
-        </thead>
-        <tbody id="candidates-body">
-          <tr><td colspan="8" class="empty-msg">No candidates awaiting review</td></tr>
-        </tbody>
-      </table>
+
+      <!-- Discovery Candidates Table -->
+      <div style="max-height: 480px; overflow-y: auto; border: 1px solid var(--line); border-radius: 6px;">
+        <table id="candidates-table">
+          <thead>
+            <tr>
+              <th style="width: 32px;"><input type="checkbox" id="select-all-cands" onchange="toggleSelectAll(this)" title="Select/Deselect All Candidates"></th>
+              <th style="width: 44px;">#</th>
+              <th style="width: 44px;">Cover</th>
+              <th>Release Title</th>
+              <th>Artist</th>
+              <th style="text-align:right;">Year</th>
+              <th style="text-align:right;">Score</th>
+              <th>Match Reason / Signals</th>
+              <th>Status</th>
+              <th style="width: 170px;">Action</th>
+            </tr>
+          </thead>
+          <tbody id="candidates-body">
+            <tr><td colspan="10" class="empty-msg">Loading discovery candidates…</td></tr>
+          </tbody>
+        </table>
+      </div>
     </div>
   </section>
 
@@ -1363,6 +1550,8 @@ let selectedPlaylistIds = new Set();
 let selectedSongIds = new Set();
 let currentSongsList = [];
 let downloadedFilesData = [];
+let currentCandFilter = 'awaiting_approval';
+let candidateFilterQuery = '';
 
 async function switchBrowserTab(tab) {
   currentBrowserTab = tab;
@@ -1373,11 +1562,13 @@ async function switchBrowserTab(tab) {
   const plView = document.getElementById("tab-view-playlists");
   const songsView = document.getElementById("tab-view-songs");
   const dlView = document.getElementById("tab-view-downloaded");
+  const discView = document.getElementById("tab-view-discovery");
   const filterInput = document.getElementById("browser-filter-input");
   const btnDlSavedAll = document.getElementById("btn-dl-saved-all");
   const btnDlSelected = document.getElementById("btn-dl-selected-songs");
   filterInput.value = "";
   songFilterQuery = "";
+  candidateFilterQuery = "";
   selectedSongIds.clear();
   updateSongSelectionUI();
 
@@ -1385,6 +1576,7 @@ async function switchBrowserTab(tab) {
     plView.style.display = "block";
     songsView.style.display = "none";
     if (dlView) dlView.style.display = "none";
+    if (discView) discView.style.display = "none";
     if (btnDlSavedAll) btnDlSavedAll.style.display = "none";
     if (btnDlSelected) btnDlSelected.style.display = "none";
     filterInput.placeholder = "Filter playlists by name or curator…";
@@ -1393,6 +1585,7 @@ async function switchBrowserTab(tab) {
     plView.style.display = "none";
     songsView.style.display = "block";
     if (dlView) dlView.style.display = "none";
+    if (discView) discView.style.display = "none";
     if (btnDlSavedAll) btnDlSavedAll.style.display = "inline-flex";
     filterInput.placeholder = "Filter liked songs…";
     document.getElementById("songs-count-label").textContent = "Showing Spotify Liked Songs";
@@ -1402,6 +1595,7 @@ async function switchBrowserTab(tab) {
     plView.style.display = "none";
     songsView.style.display = "block";
     if (dlView) dlView.style.display = "none";
+    if (discView) discView.style.display = "none";
     if (btnDlSavedAll) btnDlSavedAll.style.display = "none";
     filterInput.placeholder = "Filter all songs by title, artist, or album…";
     document.getElementById("songs-count-label").textContent = "Showing All Library Songs";
@@ -1411,10 +1605,20 @@ async function switchBrowserTab(tab) {
     plView.style.display = "none";
     songsView.style.display = "none";
     if (dlView) dlView.style.display = "block";
+    if (discView) discView.style.display = "none";
     if (btnDlSavedAll) btnDlSavedAll.style.display = "none";
     if (btnDlSelected) btnDlSelected.style.display = "none";
     filterInput.placeholder = "Filter downloaded songs by title, artist, or album…";
     loadDownloadedFiles();
+  } else if (tab === "discovery") {
+    plView.style.display = "none";
+    songsView.style.display = "none";
+    if (dlView) dlView.style.display = "none";
+    if (discView) discView.style.display = "block";
+    if (btnDlSavedAll) btnDlSavedAll.style.display = "none";
+    if (btnDlSelected) btnDlSelected.style.display = "none";
+    filterInput.placeholder = "Filter candidates by release, artist, or reason…";
+    loadDiscoveryCandidates();
   }
 }
 
@@ -1739,6 +1943,9 @@ function onBrowserFilter(val) {
       loadPlaylists();
     } else if (currentBrowserTab === "downloaded") {
       loadDownloadedFiles();
+    } else if (currentBrowserTab === "discovery") {
+      candidateFilterQuery = val.trim();
+      loadDiscoveryCandidates();
     } else {
       songFilterQuery = val.trim();
       currentSongPage = 1;
@@ -2071,28 +2278,88 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") closePlaylistModal();
 });
 
+function setCandidateFilter(status) {
+  currentCandFilter = status;
+  ["awaiting", "all", "approved", "rejected"].forEach(k => {
+    const el = document.getElementById(`btn-cand-filter-${k}`);
+    if (el) el.classList.remove("active");
+  });
+  const activeBtn = document.getElementById(
+    status === "awaiting_approval" ? "btn-cand-filter-awaiting" :
+    status === "approved" ? "btn-cand-filter-approved" :
+    status === "rejected" ? "btn-cand-filter-rejected" : "btn-cand-filter-all"
+  );
+  if (activeBtn) activeBtn.classList.add("active");
+  loadDiscoveryCandidates();
+}
+
+async function loadDiscoveryCandidates() {
+  const tbody = document.getElementById("candidates-body");
+  const data = await safeFetch(`/api/candidates?status=${currentCandFilter}&q=${encodeURIComponent(candidateFilterQuery)}`);
+  if (!data || data.error) {
+    tbody.innerHTML = `<tr><td colspan="10" class="empty-msg">Error loading candidates: ${data ? data.error : "network"}</td></tr>`;
+    return;
+  }
+  allCurrentCandidates = data.candidates || [];
+  const counts = data.counts || {};
+
+  const elPending = document.getElementById("count-cand-pending");
+  const elAll = document.getElementById("count-cand-all");
+  const elApp = document.getElementById("count-cand-approved");
+  const elRej = document.getElementById("count-cand-rejected");
+  const tabBadge = document.getElementById("discovery-tab-count");
+  if (elPending) elPending.textContent = fmt(counts.awaiting_approval || 0);
+  if (elAll) elAll.textContent = fmt(counts.all || 0);
+  if (elApp) elApp.textContent = fmt(counts.approved || 0);
+  if (elRej) elRej.textContent = fmt(counts.rejected || 0);
+  if (tabBadge) tabBadge.textContent = fmt(counts.awaiting_approval || 0);
+
+  renderCandidatesTable();
+}
+
 function renderCandidatesTable() {
   const candBody = document.getElementById("candidates-body");
   if (!allCurrentCandidates.length) {
-    candBody.innerHTML = `<tr><td colspan="8" class="empty-msg">No candidates awaiting review</td></tr>`;
+    candBody.innerHTML = `<tr><td colspan="10" class="empty-msg">No discovery candidates found matching filter</td></tr>`;
     updateSelectionUI();
     return;
   }
-  candBody.innerHTML = allCurrentCandidates.map(c => `
-    <tr>
-      <td><input type="checkbox" data-id="${c.id}" ${selectedCandidateIds.has(c.id) ? "checked" : ""} onchange="onRowSelectChange(${c.id}, this.checked)"></td>
-      <td><b>#${c.id}</b></td>
-      <td>${c.artist_name || "-"}</td>
-      <td><b>${c.release_title || c.entity_name || "-"}</b></td>
-      <td>${c.score ? c.score.toFixed(1) : "-"}</td>
-      <td><span class="badge ${c.licence ? "ok" : "warn"}">${c.licence || "unverified"}</span></td>
-      <td style="color:var(--muted); font-size:11px;">${(c.reasons || []).map(r => r.code || r.reason || r.text).join(", ")}</td>
-      <td>
-        <button class="btn-sm success" onclick="approveCandidate(${c.id})">Approve</button>
-        <button class="btn-sm danger" onclick="rejectCandidate(${c.id})">Reject</button>
-      </td>
-    </tr>
-  `).join("");
+  candBody.innerHTML = allCurrentCandidates.map((c, idx) => {
+    const isApproved = c.status === "approved";
+    const isChecked = selectedCandidateIds.has(c.id);
+    const reasonsStr = (c.reasons || []).map(r => r.text || r.reason || r.code).join("; ");
+    const coverImg = c.cover_url
+      ? `<img src="${escapeHtml(c.cover_url)}" class="cand-cover" alt="cover">`
+      : `<div class="cand-cover" style="display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:9px;font-weight:600;">FLAC</div>`;
+    const scoreVal = c.score ? `<span class="badge" style="color:var(--accent); font-weight:600;">${c.score.toFixed(1)}</span>` : "-";
+    const statusBadge = isApproved
+      ? `<span class="badge ok">Approved</span>`
+      : (c.status === "rejected" ? `<span class="badge danger">Rejected</span>` : `<span class="badge warn">Pending Review</span>`);
+
+    return `
+      <tr>
+        <td><input type="checkbox" data-id="${c.id}" ${isChecked ? "checked" : ""} onchange="onRowSelectChange(${c.id}, this.checked)"></td>
+        <td style="color:var(--muted); font-size:11px;">#${c.id}</td>
+        <td>${coverImg}</td>
+        <td>
+          <b>${escapeHtml(c.release_title || c.entity_name || "Untitled")}</b>
+          <span class="badge" style="font-size:9px; text-transform:uppercase; margin-left:4px;">${c.entity_type || "ALBUM"}</span>
+        </td>
+        <td>${escapeHtml(c.artist_name || "Unknown")}</td>
+        <td style="text-align:right; font-variant-numeric:tabular-nums;">${c.release_year || "-"}</td>
+        <td style="text-align:right; font-variant-numeric:tabular-nums;">${scoreVal}</td>
+        <td style="color:var(--muted); font-size:11px; max-width:240px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;" title="${escapeHtml(reasonsStr)}">${escapeHtml(reasonsStr || "Taste profile match")}</td>
+        <td>${statusBadge}</td>
+        <td>
+          <div style="display:flex; gap:5px; align-items:center;">
+            <button class="btn-sm primary" onclick="downloadCandidateRow(${c.id}, this)">⬇ Download</button>
+            ${!isApproved ? `<button class="btn-sm success" onclick="approveCandidate(${c.id})" title="Approve candidate">✓</button>` : ""}
+            ${c.status !== "rejected" ? `<button class="btn-sm danger" onclick="rejectCandidate(${c.id})" title="Reject candidate">✕</button>` : ""}
+          </div>
+        </td>
+      </tr>
+    `;
+  }).join("");
   updateSelectionUI();
 }
 
@@ -2121,9 +2388,9 @@ function updateSelectionUI() {
   const btnReject = document.getElementById("btn-reject-selected");
   const masterBox = document.getElementById("select-all-cands");
 
-  countEl.textContent = count ? `(${count} selected)` : "";
-  btnApprove.disabled = count === 0;
-  btnReject.disabled = count === 0;
+  if (countEl) countEl.textContent = count ? `(${count} selected)` : "";
+  if (btnApprove) btnApprove.disabled = count === 0;
+  if (btnReject) btnReject.disabled = count === 0;
   if (masterBox && allCurrentCandidates.length > 0) {
     masterBox.checked = count === allCurrentCandidates.length;
     masterBox.indeterminate = count > 0 && count < allCurrentCandidates.length;
@@ -2146,6 +2413,7 @@ async function approveSelected() {
   } catch (err) {
     showToast("Error: " + err.message, true);
   } finally {
+    loadDiscoveryCandidates();
     refreshAll();
   }
 }
@@ -2166,12 +2434,13 @@ async function rejectSelected() {
   } catch (err) {
     showToast("Error: " + err.message, true);
   } finally {
+    loadDiscoveryCandidates();
     refreshAll();
   }
 }
 
 async function approveAllPending() {
-  if (!confirm(`Are you sure you want to approve all ${allCurrentCandidates.length} pending candidates?`)) return;
+  if (!confirm(`Are you sure you want to approve all pending candidates?`)) return;
   showToast("Approving all pending candidates…");
   try {
     const res = await fetch("/api/actions/approve-all", { method: "POST" });
@@ -2185,7 +2454,158 @@ async function approveAllPending() {
   } catch (err) {
     showToast("Error: " + err.message, true);
   } finally {
+    loadDiscoveryCandidates();
     refreshAll();
+  }
+}
+
+async function downloadCandidateRow(candidateId, btn) {
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "⏳ Downloading…";
+  }
+  showToast("Downloading discovery candidate in FLAC…");
+  pollActivity();
+  try {
+    const res = await fetch(`/api/actions/download-candidate?candidate_id=${candidateId}`, { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      showToast(`✓ Download complete: '${data.title || "Track"}' is ready on disk & added to FiiO card!`);
+      loadDiscoveryCandidates();
+      loadSongs();
+      refreshAll();
+    } else {
+      showToast("Download failed: " + (data.error || "failed"), true);
+    }
+  } catch (err) {
+    showToast("Error: " + err.message, true);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "⬇ Download";
+    }
+    pollActivity();
+  }
+}
+
+async function runDiscoveryScan(btn) {
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "⏳ Scanning…";
+  }
+  showToast("Scanning Spotify, MusicBrainz, and Internet Archive for unowned music…");
+  pollActivity();
+  try {
+    const res = await fetch("/api/actions/discover?limit_artists=10", { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      const summary = data.summary || {};
+      showToast(`✓ Discovery scan complete: found ${summary.albums || 0} unowned releases! (${data.pending} pending review)`);
+      loadDiscoveryCandidates();
+      refreshAll();
+    } else {
+      showToast("Discovery scan error: " + (data.error || "failed"), true);
+    }
+  } catch (err) {
+    showToast("Error: " + err.message, true);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "⚡ Scan For New Music";
+    }
+    pollActivity();
+  }
+}
+
+async function runExploreSearch() {
+  const input = document.getElementById("explore-input");
+  const query = input.value.trim();
+  if (!query) return;
+  const box = document.getElementById("explore-results-box");
+  const list = document.getElementById("explore-results-list");
+  const btn = document.getElementById("btn-explore-search");
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "Exploring…";
+  }
+  box.style.display = "block";
+  list.innerHTML = `<span style="color:var(--muted); font-size:12px; padding:6px 0;">Searching public music sources for "${escapeHtml(query)}"…</span>`;
+  try {
+    const res = await fetch(`/api/discovery/explore?q=${encodeURIComponent(query)}`);
+    const data = await res.json();
+    const results = data.results || [];
+    if (!results.length) {
+      list.innerHTML = `<span style="color:var(--muted); font-size:12px; padding:6px 0;">No discoverable tracks found for "${escapeHtml(query)}"</span>`;
+      return;
+    }
+    list.innerHTML = results.map(t => {
+      const coverHtml = t.cover_url
+        ? `<img src="${escapeHtml(t.cover_url)}" style="width:36px; height:36px; border-radius:3px; object-fit:cover;" alt="cover">`
+        : `<div style="width:36px; height:36px; border-radius:3px; background:#141c2b; display:flex; align-items:center; justify-content:center; color:var(--muted); font-size:9px;">FLAC</div>`;
+      const isReady = t.is_ready;
+      return `
+        <div class="explore-item">
+          <div style="display:flex; align-items:center; gap:10px;">
+            ${coverHtml}
+            <div>
+              <div style="font-weight:600; color:#fff;">${escapeHtml(t.title)}</div>
+              <div style="color:var(--muted); font-size:11px;">${escapeHtml(t.artist_name)} • ${escapeHtml(t.album_title || "Single")} • ${t.release_date ? t.release_date.slice(0, 4) : ""}</div>
+            </div>
+          </div>
+          <div>
+            ${isReady
+              ? '<span class="badge ok">✓ In Library</span>'
+              : `<button class="btn-sm primary" onclick="downloadExploreTrackRow(this, '${escapeHtml(t.title).replace(/'/g, "\\'")}', '${escapeHtml(t.artist_name).replace(/'/g, "\\'")}', '${escapeHtml(t.album_title || "Single").replace(/'/g, "\\'")}', '${t.spotify_id || ""}', '${t.cover_url || ""}')">⬇ Download (FLAC)</button>`
+            }
+          </div>
+        </div>
+      `;
+    }).join("");
+  } catch (err) {
+    list.innerHTML = `<span style="color:var(--bad); font-size:12px;">Exploration error: ${err.message}</span>`;
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "Explore";
+    }
+  }
+}
+
+async function downloadExploreTrackRow(btn, title, artist, album, spotifyId, coverUrl) {
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "⏳ Downloading…";
+  }
+  showToast(`Downloading newly discovered track: '${title}'…`);
+  pollActivity();
+  try {
+    const params = new URLSearchParams({ title, artist, album });
+    if (spotifyId) params.append("spotify_id", spotifyId);
+    if (coverUrl) params.append("cover_url", coverUrl);
+    const res = await fetch(`/api/actions/download-explore-track?${params.toString()}`, { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      showToast(`✓ Downloaded and verified: '${title}' by ${artist} is ready on disk!`);
+      if (btn) {
+        btn.outerHTML = '<span class="badge ok">✓ In Library</span>';
+      }
+      loadSongs();
+      refreshAll();
+    } else {
+      showToast("Download failed: " + (data.error || "failed"), true);
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "⬇ Download (FLAC)";
+      }
+    }
+  } catch (err) {
+    showToast("Error: " + err.message, true);
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "⬇ Download (FLAC)";
+    }
+  } finally {
+    pollActivity();
   }
 }
 

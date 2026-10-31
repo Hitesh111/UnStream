@@ -91,6 +91,17 @@ def test_dashboard_endpoints(config: Config, db: Database) -> None:
     assert batch_res.status_code == 200
     assert batch_res.json()["ok"] is True
 
+    # Candidates endpoint with status counts
+    cands_res = client.get("/api/candidates", headers=headers)
+    assert cands_res.status_code == 200
+    assert "counts" in cands_res.json()
+    assert "candidates" in cands_res.json()
+
+    # Discovery explore endpoint
+    exp_disc = client.get("/api/discovery/explore?q=Krautrock", headers=headers)
+    assert exp_disc.status_code == 200
+    assert "results" in exp_disc.json()
+
     blocked = client.get("/api/health", headers={"host": "evil.example"})
     assert blocked.status_code == 403
 
