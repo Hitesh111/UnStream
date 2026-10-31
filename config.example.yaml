@@ -1,0 +1,82 @@
+app:
+  name: FiiO Library Manager
+  timezone: Asia/Kolkata
+  library_root: ~/FiiO-Library
+  log_level: INFO
+
+spotify:
+  enabled: true
+  sync_interval_hours: 24
+  redirect_port: 8888
+  scopes:
+    - user-library-read
+    - user-read-private
+    - playlist-read-private
+    - playlist-read-collaborative
+    - user-follow-read
+    - user-top-read
+    - user-read-recently-played
+  seed_playlists:
+    - https://open.spotify.com/playlist/6V86seTLw2FSy5WBTUfae2
+    - https://open.spotify.com/playlist/1BGHcG9AN9UDHGrrjCUjJ1
+    - https://open.spotify.com/playlist/15zzC70rsq2d9wDljIGfcA
+    - https://open.spotify.com/playlist/2HPeTkcP8FxWMXPJmeOcPc
+    - https://open.spotify.com/playlist/6Ot5lhgOxeUkvfX1eWCGFe
+    - https://open.spotify.com/playlist/7frGlhPUlk5Ox3Er63IgJM
+    - https://open.spotify.com/playlist/0off2g6AJw2wBuPzk85VRL
+
+audio:
+  preferred_format: FLAC
+  preferred_sample_rates: [44100, 48000, 96000]
+  preferred_bit_depths: [16, 24]
+  fallback_format: MP3
+  fallback_bitrate: 320
+  ffmpeg_path: ffmpeg
+  ffprobe_path: ffprobe
+  flac_block_size: 4096
+  max_channels: 2
+
+downloads:
+  enabled: false
+  approval_required: true
+  preferred_method: authorised_torrent
+  qbittorrent_url: http://127.0.0.1:8080
+  qbittorrent_username: admin
+  min_free_gb: 2
+  max_concurrent: 3
+
+discovery:
+  musicbrainz_user_agent: FiiO-Library-Manager/0.1 (personal use)
+  musicbrainz_min_interval_seconds: 1.0
+  internet_archive_min_interval_seconds: 1.0
+  max_candidates_per_artist: 5
+  allow_manual_review_candidates: false
+
+library:
+  duplicate_detection: true
+  preserve_original_metadata: true
+  organize_on_verify: true
+  audio_extensions: [".flac", ".mp3", ".m4a", ".ogg", ".wav", ".ape", ".dsf", ".dff", ".wma"]
+
+device:
+  expected_player: SNOWSKY Echo Mini
+  expected_card_capacity_gb: 64
+  filesystem_whitelist: [exfat, msdos, fat32]
+  auto_detect: true
+  auto_sync: false
+  dry_run_by_default: true
+  reserve_free_gb: 1.5
+  music_subdir: Music
+  artwork_size: 500
+  max_flac_block_size: 4608
+
+automation:
+  spotify_sync: daily
+  discovery: daily
+  integrity_check: weekly
+  metadata_refresh: weekly
+  card_sync: on_detect_user_enabled
+
+dashboard:
+  host: 127.0.0.1
+  port: 8765
