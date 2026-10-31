@@ -114,12 +114,125 @@ def create_app(config: Config, db: Database) -> FastAPI:
             ]
         }
 
+    @app.get("/api/playlists")
+    def list_playlists(
+        q: str = Query(default=""),
+        only_with_tracks: bool = Query(default=False),
+    ) -> dict[str, Any]:
+        query = q.strip()
+        sql = (
+            "SELECT p.id, p.spotify_id, p.name, p.owner_name, p.description, p.total_tracks, "
+            "p.public, p.collaborative, p.kind, COUNT(pt.track_id) AS indexed_tracks "
+            "FROM playlists p "
+            "LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id "
+        )
+        params: list[Any] = []
+        if query:
+            sql += "WHERE (p.name LIKE ? OR p.owner_name LIKE ?) "
+            params.extend([f"%{query}%", f"%{query}%"])
+        sql += "GROUP BY p.id "
+        if only_with_tracks:
+            sql += "HAVING indexed_tracks > 0 "
+        sql += "ORDER BY (CASE WHEN p.owner_name = 'Hitesh' THEN 0 ELSE 1 END), indexed_tracks DESC, p.name COLLATE NOCASE ASC"
+        rows = [dict(row) for row in db.query(sql, tuple(params))]
+        return {"count": len(rows), "playlists": rows}
+
+    @app.get("/api/playlists/{playlist_id}/tracks")
+    def playlist_tracks(playlist_id: int) -> Any:
+        pl_row = db.one("SELECT * FROM playlists WHERE id = ?", (playlist_id,))
+        if not pl_row:
+            return JSONResponse({"error": "Playlist not found"}, status_code=404)
+        tracks = [
+            dict(row)
+            for row in db.query(
+                "SELECT pt.position, t.id, t.title, a.name AS artist_name, al.title AS album_title, "
+                "t.track_number, t.duration_ms, f.validated, f.path "
+                "FROM playlist_tracks pt "
+                "JOIN tracks t ON t.id = pt.track_id "
+                "JOIN artists a ON a.id = t.artist_id "
+                "JOIN albums al ON al.id = t.album_id "
+                "LEFT JOIN files f ON f.track_id = t.id "
+                "WHERE pt.playlist_id = ? "
+                "ORDER BY pt.position ASC, t.id ASC",
+                (playlist_id,),
+            )
+        ]
+        return {
+            "playlist": dict(pl_row),
+            "count": len(tracks),
+            "tracks": tracks,
+        }
+
+    @app.get("/api/songs")
+    def list_songs(
+        q: str = Query(default=""),
+        category: str = Query(default="all"),
+        page: int = Query(default=1, ge=1),
+        page_size: int = Query(default=50, ge=1, le=200),
+    ) -> dict[str, Any]:
+        query = q.strip()
+        conditions: list[str] = []
+        params: list[Any] = []
+
+        join_clause = (
+            "FROM tracks t "
+            "JOIN artists a ON a.id = t.artist_id "
+            "JOIN albums al ON al.id = t.album_id "
+            "LEFT JOIN files f ON f.track_id = t.id "
+        )
+
+        if category == "saved":
+            join_clause += "JOIN spotify_saved_tracks st ON st.track_id = t.id "
+        elif category == "synced":
+            conditions.append("f.validated = 1")
+
+        if query:
+            pattern = f"%{query}%"
+            conditions.append("(t.title LIKE ? OR a.name LIKE ? OR al.title LIKE ?)")
+            params.extend([pattern, pattern, pattern])
+
+        where_sql = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+
+        count_sql = f"SELECT COUNT(DISTINCT t.id) {join_clause} {where_sql}"
+        total_count = int(db.scalar(count_sql, tuple(params)) or 0)
+
+        offset = (page - 1) * page_size
+        data_sql = (
+            f"SELECT t.id, t.title, a.name AS artist_name, al.title AS album_title, "
+            f"t.track_number, t.duration_ms, f.validated, f.path "
+            f"{join_clause} {where_sql} "
+            f"GROUP BY t.id "
+            f"ORDER BY a.name COLLATE NOCASE ASC, al.title COLLATE NOCASE ASC, t.track_number ASC "
+            f"LIMIT ? OFFSET ?"
+        )
+        data_params = list(params) + [page_size, offset]
+        rows = [dict(row) for row in db.query(data_sql, tuple(data_params))]
+        total_pages = max(1, (total_count + page_size - 1) // page_size)
+        return {
+            "total": total_count,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
+            "songs": rows,
+        }
+
     @app.get("/api/search")
     def search(q: str = Query(default="")) -> dict[str, Any]:
         query = q.strip()
         if not query:
-            return {"query": "", "tracks": [], "artists": [], "candidates": []}
+            return {"query": "", "playlists": [], "tracks": [], "artists": [], "candidates": []}
         pattern = f"%{query}%"
+        playlists = [
+            dict(row)
+            for row in db.query(
+                "SELECT p.id, p.name, p.owner_name, p.total_tracks, COUNT(pt.track_id) AS indexed_tracks "
+                "FROM playlists p "
+                "LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id "
+                "WHERE p.name LIKE ? OR p.owner_name LIKE ? "
+                "GROUP BY p.id ORDER BY (CASE WHEN p.owner_name = 'Hitesh' THEN 0 ELSE 1 END), indexed_tracks DESC, p.name ASC LIMIT 15",
+                (pattern, pattern),
+            )
+        ]
         tracks = [
             dict(row)
             for row in db.query(
@@ -160,7 +273,7 @@ def create_app(config: Config, db: Database) -> FastAPI:
                 c["reasons"] = json.loads(c.get("reasons") or "[]")
             except Exception:
                 c["reasons"] = []
-        return {"query": query, "tracks": tracks, "artists": artists, "candidates": candidates}
+        return {"query": query, "playlists": playlists, "tracks": tracks, "artists": artists, "candidates": candidates}
 
     @app.post("/api/actions/sync")
     def action_sync(dry_run: bool = Query(default=True)) -> dict[str, Any]:
@@ -298,6 +411,9 @@ def _status(config: Config, db: Database) -> dict[str, Any]:
         "acquisitions": int(db.scalar("SELECT COUNT(*) FROM acquisitions") or 0),
         "sync_runs": int(db.scalar("SELECT COUNT(*) FROM sync_runs") or 0),
         "files": int(db.scalar("SELECT COUNT(*) FROM files") or 0),
+        "playlists": int(db.scalar("SELECT COUNT(*) FROM playlists") or 0),
+        "saved_tracks": int(db.scalar("SELECT COUNT(*) FROM spotify_saved_tracks") or 0),
+        "tracks": int(db.scalar("SELECT COUNT(*) FROM tracks") or 0),
     }
     return capabilities
 
@@ -514,6 +630,59 @@ footer {
 .btn-sm { padding: 4px 8px; font-size: 11px; border-radius: 4px; }
 .empty-msg { color: var(--muted); font-size: 12px; padding: 14px 0; font-style: italic; }
 input[type="checkbox"] { cursor: pointer; }
+
+.tabs-nav {
+  display: flex;
+  gap: 4px;
+  background: #0c121c;
+  padding: 3px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+}
+.tab-btn {
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  padding: 4px 10px;
+  font-size: 11px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: 500;
+  transition: all 0.15s ease;
+}
+.tab-btn:hover { color: #fff; background: rgba(255,255,255,0.05); }
+.tab-btn.active { color: #fff; background: #1e293b; font-weight: 600; border: 1px solid var(--line-light); }
+.clickable-row { cursor: pointer; }
+.clickable-row:hover td { background: rgba(56, 189, 248, 0.05) !important; }
+.modal-overlay {
+  display: none;
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.75);
+  backdrop-filter: blur(4px);
+  z-index: 9999;
+  align-items: center;
+  justify-content: center;
+}
+.modal-dialog {
+  background: #0f1624;
+  border: 1px solid var(--line-light);
+  border-radius: 10px;
+  width: 92%;
+  max-width: 950px;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6);
+  animation: fadeIn 0.15s ease-out;
+}
+@keyframes fadeIn {
+  from { opacity: 0; transform: scale(0.98); }
+  to { opacity: 1; transform: scale(1); }
+}
 </style>
 </head>
 <body>
@@ -579,6 +748,79 @@ input[type="checkbox"] { cursor: pointer; }
     <div id="pipeline">Loading…</div>
   </section>
 
+  <!-- Spotify Library Browser (Playlists & Songs) -->
+  <section class="full-width" id="spotify-browser-section">
+    <div class="sec-head">
+      <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap;">
+        <h2>Spotify Library & Playlists</h2>
+        <div class="tabs-nav" id="browser-tabs">
+          <button class="tab-btn active" id="tab-btn-playlists" onclick="switchBrowserTab('playlists')">Playlists (<span id="pl-tab-count">110</span>)</button>
+          <button class="tab-btn" id="tab-btn-saved" onclick="switchBrowserTab('saved')">Liked Songs (<span id="saved-tab-count">372</span>)</button>
+          <button class="tab-btn" id="tab-btn-all_songs" onclick="switchBrowserTab('all_songs')">All Songs (<span id="all-songs-tab-count">2,028</span>)</button>
+        </div>
+      </div>
+      <div class="sec-head-actions">
+        <input type="text" id="browser-filter-input" placeholder="Filter playlists by name or curator…" oninput="onBrowserFilter(this.value)" style="background:#141c2b; border:1px solid var(--line-light); border-radius:4px; padding:5px 10px; font-size:12px; color:#fff; width:240px; outline:none;">
+      </div>
+    </div>
+
+    <!-- Playlists View -->
+    <div id="tab-view-playlists">
+      <div style="margin-bottom: 10px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+        <span style="color:var(--muted); font-size:11px;">Browse your Spotify playlists. Click any row or "Inspect Songs" to view full tracklist.</span>
+        <label style="font-size:11px; color:var(--muted); cursor:pointer; display:flex; align-items:center; gap:6px;">
+          <input type="checkbox" id="chk-only-indexed" onchange="loadPlaylists()" checked> Only playlists with tracks
+        </label>
+      </div>
+      <div style="max-height: 480px; overflow-y: auto; border: 1px solid var(--line); border-radius: 6px;">
+        <table id="playlists-table">
+          <thead>
+            <tr>
+              <th>Playlist Name</th>
+              <th>Curator / Owner</th>
+              <th style="text-align:right;">Indexed Tracks</th>
+              <th style="text-align:right;">Total Tracks</th>
+              <th>Status</th>
+              <th style="width: 140px;">Action</th>
+            </tr>
+          </thead>
+          <tbody id="playlists-body">
+            <tr><td colspan="6" class="empty-msg">Loading playlists…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Songs View (Liked Songs & All Songs) -->
+    <div id="tab-view-songs" style="display:none;">
+      <div style="margin-bottom: 10px; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
+        <span id="songs-count-label" style="color:var(--muted); font-size:11px;">Showing songs from your library</span>
+        <div style="display:flex; align-items:center; gap:8px;">
+          <button class="btn-sm" id="btn-song-prev" onclick="changeSongPage(-1)" disabled>◀ Previous</button>
+          <span id="song-page-indicator" style="font-size:11px; color:var(--muted); font-variant-numeric:tabular-nums;">Page 1 of 1</span>
+          <button class="btn-sm" id="btn-song-next" onclick="changeSongPage(1)" disabled>Next ▶</button>
+        </div>
+      </div>
+      <div style="max-height: 480px; overflow-y: auto; border: 1px solid var(--line); border-radius: 6px;">
+        <table id="songs-table">
+          <thead>
+            <tr>
+              <th style="width: 44px;">#</th>
+              <th>Song Title</th>
+              <th>Artist</th>
+              <th>Album</th>
+              <th style="text-align:right;">Length</th>
+              <th>FiiO Card State</th>
+            </tr>
+          </thead>
+          <tbody id="songs-body">
+            <tr><td colspan="6" class="empty-msg">Loading songs…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
   <!-- Candidates with Multi-Select and Bulk Actions -->
   <section class="full-width">
     <div class="sec-head">
@@ -633,6 +875,36 @@ input[type="checkbox"] { cursor: pointer; }
   </section>
 </main>
 
+<!-- Playlist Detail Modal -->
+<div id="playlist-modal" class="modal-overlay" onclick="onModalOverlayClick(event)">
+  <div class="modal-dialog">
+    <div style="padding:16px 20px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center;">
+      <div>
+        <h3 id="modal-pl-title" style="margin:0; font-size:15px; font-weight:600; color:#fff;">Playlist Title</h3>
+        <span id="modal-pl-subtitle" style="font-size:11px; color:var(--muted);">Curator • Total Tracks</span>
+      </div>
+      <button class="btn-sm" onclick="closePlaylistModal()">✕ Close</button>
+    </div>
+    <div style="padding:14px 20px; overflow-y:auto; flex:1;">
+      <table id="modal-pl-table">
+        <thead>
+          <tr>
+            <th style="width:36px;">#</th>
+            <th>Song Title</th>
+            <th>Artist</th>
+            <th>Album</th>
+            <th style="text-align:right;">Length</th>
+            <th>FiiO Echo Mini State</th>
+          </tr>
+        </thead>
+        <tbody id="modal-pl-body">
+          <tr><td colspan="6" class="empty-msg">Loading tracks…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
 <footer>
   <span>Local loopback only (127.0.0.1). Hardware limits strictly checked against Echo Mini.</span>
   <span>Auto-refreshes every 10 seconds</span>
@@ -647,6 +919,14 @@ const kv = (label, value, cls="") => `<div class="kv"><span>${label}</span><b cl
 let allCurrentCandidates = [];
 let selectedCandidateIds = new Set();
 let searchDebounceTimer = null;
+
+let currentBrowserTab = "playlists";
+let playlistsData = [];
+let songFilterQuery = "";
+let currentSongPage = 1;
+let totalSongPages = 1;
+let browserFilterTimer = null;
+let initialPlaylistsLoaded = false;
 
 function showToast(msg, isError=false) {
   const el = document.getElementById("toast");
@@ -721,7 +1001,7 @@ async function refreshAll() {
     }
   }
 
-  // Pipeline
+  // Pipeline & Tabs
   if (s && !s.error && s.counts) {
     const c = s.counts;
     document.getElementById("pipeline").innerHTML =
@@ -730,6 +1010,15 @@ async function refreshAll() {
       kv("Approved Acquisitions", fmt(c.acquisitions)) +
       kv("Total Sync Runs", fmt(c.sync_runs)) +
       kv("Reserved Capacity", "1.50 GB (Protected)");
+
+    if (c.playlists != null) document.getElementById("pl-tab-count").textContent = fmt(c.playlists);
+    if (c.saved_tracks != null) document.getElementById("saved-tab-count").textContent = fmt(c.saved_tracks);
+    if (c.tracks != null) document.getElementById("all-songs-tab-count").textContent = fmt(c.tracks);
+  }
+
+  if (!initialPlaylistsLoaded) {
+    initialPlaylistsLoaded = true;
+    loadPlaylists();
   }
 
   // Candidates Table with Checkboxes
@@ -771,6 +1060,185 @@ async function refreshAll() {
 
   document.getElementById("stamp").textContent = "updated " + new Date().toLocaleTimeString();
 }
+
+async function switchBrowserTab(tab) {
+  currentBrowserTab = tab;
+  document.querySelectorAll("#browser-tabs .tab-btn").forEach(b => b.classList.remove("active"));
+  const activeBtn = document.getElementById(`tab-btn-${tab}`);
+  if (activeBtn) activeBtn.classList.add("active");
+
+  const plView = document.getElementById("tab-view-playlists");
+  const songsView = document.getElementById("tab-view-songs");
+  const filterInput = document.getElementById("browser-filter-input");
+  filterInput.value = "";
+  songFilterQuery = "";
+
+  if (tab === "playlists") {
+    plView.style.display = "block";
+    songsView.style.display = "none";
+    filterInput.placeholder = "Filter playlists by name or curator…";
+    loadPlaylists();
+  } else if (tab === "saved") {
+    plView.style.display = "none";
+    songsView.style.display = "block";
+    filterInput.placeholder = "Filter liked songs…";
+    document.getElementById("songs-count-label").textContent = "Showing Spotify Liked Songs";
+    currentSongPage = 1;
+    loadSongs();
+  } else if (tab === "all_songs") {
+    plView.style.display = "none";
+    songsView.style.display = "block";
+    filterInput.placeholder = "Filter all songs by title, artist, or album…";
+    document.getElementById("songs-count-label").textContent = "Showing All Library Songs";
+    currentSongPage = 1;
+    loadSongs();
+  }
+}
+
+async function loadPlaylists() {
+  const onlyIndexed = document.getElementById("chk-only-indexed").checked;
+  const q = document.getElementById("browser-filter-input").value.trim();
+  const tbody = document.getElementById("playlists-body");
+  const data = await safeFetch(`/api/playlists?only_with_tracks=${onlyIndexed ? "true" : "false"}&q=${encodeURIComponent(q)}`);
+  if (!data || data.error) {
+    tbody.innerHTML = `<tr><td colspan="6" class="empty-msg">Error loading playlists: ${data ? data.error : "network"}</td></tr>`;
+    return;
+  }
+  playlistsData = data.playlists || [];
+  if (!q && !onlyIndexed) {
+    document.getElementById("pl-tab-count").textContent = fmt(playlistsData.length);
+  }
+  if (!playlistsData.length) {
+    tbody.innerHTML = `<tr><td colspan="6" class="empty-msg">No playlists match current filter</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = playlistsData.map(p => `
+    <tr class="clickable-row" onclick="openPlaylist(${p.id})">
+      <td><b>${p.name}</b>${p.description ? `<br><span style="color:var(--muted); font-size:11px;">${p.description.slice(0, 75)}</span>` : ""}</td>
+      <td>${p.owner_name}</td>
+      <td style="text-align:right;">${p.indexed_tracks > 0 ? `<b class="ok">${p.indexed_tracks}</b>` : `<span style="color:var(--muted); font-size:11px;">0</span>`}</td>
+      <td style="text-align:right;">${p.total_tracks}</td>
+      <td><span class="badge ${p.indexed_tracks > 0 ? "ok" : "warn"}">${p.indexed_tracks > 0 ? "Ready (" + p.indexed_tracks + " songs)" : "Third-Party"}</span></td>
+      <td>
+        <button class="btn-sm" onclick="event.stopPropagation(); openPlaylist(${p.id})">Inspect (${p.indexed_tracks}) ▶</button>
+      </td>
+    </tr>
+  `).join("");
+}
+
+async function loadSongs() {
+  const tbody = document.getElementById("songs-body");
+  const category = (currentBrowserTab === "saved") ? "saved" : "all";
+  const q = songFilterQuery;
+  const data = await safeFetch(`/api/songs?category=${category}&q=${encodeURIComponent(q)}&page=${currentSongPage}&page_size=50`);
+  if (!data || data.error) {
+    tbody.innerHTML = `<tr><td colspan="6" class="empty-msg">Error loading songs: ${data ? data.error : "network"}</td></tr>`;
+    return;
+  }
+  const songs = data.songs || [];
+  totalSongPages = data.total_pages || 1;
+  document.getElementById("song-page-indicator").textContent = `Page ${data.page} of ${totalSongPages} (${fmt(data.total)} songs)`;
+  document.getElementById("btn-song-prev").disabled = data.page <= 1;
+  document.getElementById("btn-song-next").disabled = data.page >= totalSongPages;
+
+  if (category === "saved") {
+    if (!q) document.getElementById("saved-tab-count").textContent = fmt(data.total);
+    document.getElementById("songs-count-label").textContent = `Showing ${fmt(data.total)} Spotify Liked Songs`;
+  } else {
+    if (!q) document.getElementById("all-songs-tab-count").textContent = fmt(data.total);
+    document.getElementById("songs-count-label").textContent = `Showing ${fmt(data.total)} Library Songs`;
+  }
+
+  if (!songs.length) {
+    tbody.innerHTML = `<tr><td colspan="6" class="empty-msg">No songs found matching query</td></tr>`;
+    return;
+  }
+
+  const offset = (data.page - 1) * 50;
+  tbody.innerHTML = songs.map((s, idx) => `
+    <tr>
+      <td style="color:var(--muted);">${offset + idx + 1}</td>
+      <td><b>${s.title}</b></td>
+      <td>${s.artist_name}</td>
+      <td>${s.album_title}</td>
+      <td style="text-align:right;">${msToMin(s.duration_ms)}</td>
+      <td>${s.validated ? '<span class="badge ok">✓ Synced to Card</span>' : (s.path ? '<span class="badge sync">Local Matched</span>' : '<span class="badge">Spotify Cloud</span>')}</td>
+    </tr>
+  `).join("");
+}
+
+function changeSongPage(delta) {
+  const target = currentSongPage + delta;
+  if (target >= 1 && target <= totalSongPages) {
+    currentSongPage = target;
+    loadSongs();
+  }
+}
+
+function onBrowserFilter(val) {
+  clearTimeout(browserFilterTimer);
+  browserFilterTimer = setTimeout(() => {
+    if (currentBrowserTab === "playlists") {
+      loadPlaylists();
+    } else {
+      songFilterQuery = val.trim();
+      currentSongPage = 1;
+      loadSongs();
+    }
+  }, 250);
+}
+
+async function openPlaylist(id) {
+  const modal = document.getElementById("playlist-modal");
+  const title = document.getElementById("modal-pl-title");
+  const subtitle = document.getElementById("modal-pl-subtitle");
+  const tbody = document.getElementById("modal-pl-body");
+
+  modal.style.display = "flex";
+  title.textContent = "Loading playlist…";
+  subtitle.textContent = "";
+  tbody.innerHTML = `<tr><td colspan="6" class="empty-msg">Fetching tracks from database…</td></tr>`;
+
+  const data = await safeFetch(`/api/playlists/${id}/tracks`);
+  if (!data || data.error) {
+    title.textContent = "Playlist Error";
+    tbody.innerHTML = `<tr><td colspan="6" class="empty-msg">${data ? data.error : "Failed to load"}</td></tr>`;
+    return;
+  }
+
+  const pl = data.playlist;
+  title.textContent = pl.name;
+  subtitle.textContent = `Curator: ${pl.owner_name} • ${data.count} tracks indexed in local database (${pl.total_tracks} total on Spotify)`;
+
+  const tracks = data.tracks || [];
+  if (!tracks.length) {
+    tbody.innerHTML = `<tr><td colspan="6" class="empty-msg">No tracks indexed for this playlist yet (Spotify Web API 2026 Developer restriction on non-collaborative third-party playlists).</td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = tracks.map(t => `
+    <tr>
+      <td style="color:var(--muted);">${t.position != null ? (t.position + 1) : "-"}</td>
+      <td><b>${t.title}</b></td>
+      <td>${t.artist_name}</td>
+      <td>${t.album_title}</td>
+      <td style="text-align:right;">${msToMin(t.duration_ms)}</td>
+      <td>${t.validated ? '<span class="badge ok">✓ Synced to Card</span>' : (t.path ? '<span class="badge sync">Local Matched</span>' : '<span class="badge">Spotify Cloud Track</span>')}</td>
+    </tr>
+  `).join("");
+}
+
+function closePlaylistModal() {
+  document.getElementById("playlist-modal").style.display = "none";
+}
+
+function onModalOverlayClick(e) {
+  if (e.target.id === "playlist-modal") closePlaylistModal();
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closePlaylistModal();
+});
 
 function renderCandidatesTable() {
   const candBody = document.getElementById("candidates-body");
@@ -915,9 +1383,27 @@ async function executeSearch(q) {
 
   let html = "";
 
+  // Matching Playlists
+  if (data.playlists && data.playlists.length) {
+    html += `<h3 style="font-size:12px; text-transform:uppercase; color:#fff; margin:10px 0 6px;">Matching Spotify Playlists (${data.playlists.length})</h3>`;
+    html += `<table><thead><tr><th>Playlist Name</th><th>Curator</th><th style="text-align:right;">Indexed Tracks</th><th style="text-align:right;">Total Tracks</th><th>Action</th></tr></thead><tbody>`;
+    html += data.playlists.map(p => `
+      <tr class="clickable-row" onclick="openPlaylist(${p.id})">
+        <td><b>${p.name}</b></td>
+        <td>${p.owner_name}</td>
+        <td style="text-align:right;">${p.indexed_tracks > 0 ? `<b class="ok">${p.indexed_tracks}</b>` : `<span style="color:var(--muted);">-</span>`}</td>
+        <td style="text-align:right;">${p.total_tracks}</td>
+        <td>
+          <button class="btn-sm" onclick="event.stopPropagation(); openPlaylist(${p.id})">Inspect Songs (${p.indexed_tracks}) ▶</button>
+        </td>
+      </tr>
+    `).join("");
+    html += `</tbody></table>`;
+  }
+
   // Matching Library Tracks
   if (data.tracks && data.tracks.length) {
-    html += `<h3 style="font-size:12px; text-transform:uppercase; color:var(--accent); margin:10px 0 6px;">Songs & Library Tracks (${data.tracks.length})</h3>`;
+    html += `<h3 style="font-size:12px; text-transform:uppercase; color:var(--accent); margin:16px 0 6px;">Songs & Library Tracks (${data.tracks.length})</h3>`;
     html += `<table><thead><tr><th>Song Title</th><th>Artist</th><th>Album</th><th>Length</th><th>State</th></tr></thead><tbody>`;
     html += data.tracks.map(t => `
       <tr>
@@ -966,8 +1452,8 @@ async function executeSearch(q) {
     html += `</tbody></table>`;
   }
 
-  if (!data.tracks.length && !data.artists.length && !data.candidates.length) {
-    html = `<div class="empty-msg">No artists, songs, or candidates matched "${q}"</div>`;
+  if (!data.playlists?.length && !data.tracks.length && !data.artists.length && !data.candidates.length) {
+    html = `<div class="empty-msg">No playlists, songs, artists, or candidates matched "${q}"</div>`;
   }
 
   content.innerHTML = html;

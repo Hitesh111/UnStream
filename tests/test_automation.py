@@ -52,6 +52,17 @@ def test_dashboard_endpoints(config: Config, db: Database) -> None:
     status = client.get("/api/status", headers=headers)
     assert status.status_code == 200
     assert "devices" in status.json()
+
+    # Playlists and songs browser endpoints
+    pl_res = client.get("/api/playlists", headers=headers)
+    assert pl_res.status_code == 200
+    assert "playlists" in pl_res.json()
+
+    songs_res = client.get("/api/songs", headers=headers)
+    assert songs_res.status_code == 200
+    assert "songs" in songs_res.json()
+    assert "total" in songs_res.json()
+
     assert client.get("/", headers=headers).status_code == 200
 
     blocked = client.get("/api/health", headers={"host": "evil.example"})
