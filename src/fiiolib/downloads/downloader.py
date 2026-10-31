@@ -332,14 +332,64 @@ def export_playlist_m3u(
     return m3u_path
 
 
+def export_saved_tracks_m3u(
+    config: Config, db: Database, target_dir: Path | None = None
+) -> Path | None:
+    """Generate an Echo Mini compliant UTF-8 .m3u8 playlist file for Spotify Liked Songs."""
+    if not target_dir:
+        target_dir = config.root / "playlists"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    m3u_path = target_dir / "Liked Songs.m3u8"
+
+    tracks = db.query(
+        "SELECT t.title, a.name AS artist_name, t.duration_ms, f.path "
+        "FROM spotify_saved_tracks st "
+        "JOIN tracks t ON t.id = st.track_id "
+        "JOIN artists a ON a.id = t.artist_id "
+        "LEFT JOIN files f ON f.track_id = t.id AND f.validated = 1 "
+        "ORDER BY st.added_at DESC",
+    )
+    lines = ["#EXTM3U", "#PLAYLIST:Liked Songs"]
+    matched = 0
+    music_dir = config.music_dir.resolve()
+    for t in tracks:
+        file_path_str = t["path"]
+        if not file_path_str:
+            continue
+        fp = Path(file_path_str)
+        if not fp.exists():
+            continue
+        dur_sec = (t["duration_ms"] or 0) // 1000
+        lines.append(f"#EXTINF:{dur_sec},{t['artist_name']} - {t['title']}")
+        try:
+            rel_within_music = fp.resolve().relative_to(music_dir)
+            lines.append(f"../Music/{rel_within_music.as_posix()}")
+        except ValueError:
+            try:
+                rel = os.path.relpath(file_path_str, target_dir)
+                lines.append(rel)
+            except ValueError:
+                lines.append(file_path_str)
+        matched += 1
+
+    if matched == 0:
+        return None
+
+    m3u_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return m3u_path
+
+
 def export_all_playlists(config: Config, db: Database, target_dir: Path | None = None) -> list[str]:
-    """Export all playlists that contain at least one downloaded audio track."""
+    """Export all playlists (including Liked Songs) that contain at least one downloaded audio track."""
     rows = db.query("SELECT DISTINCT playlist_id FROM playlist_tracks")
     exported = []
     for r in rows:
         path = export_playlist_m3u(config, db, int(r["playlist_id"]), target_dir=target_dir)
         if path:
             exported.append(str(path))
+    saved_path = export_saved_tracks_m3u(config, db, target_dir=target_dir)
+    if saved_path:
+        exported.append(str(saved_path))
     return exported
 
 
@@ -424,21 +474,35 @@ def download_all_playlists(
     return download_playlists_batch(config, db, pids, max_tracks_per_playlist=max_tracks_per_playlist)
 
 
-def download_saved_tracks(config: Config, db: Database, limit: int = 25) -> dict[str, Any]:
-    """Download top user saved (Liked) tracks."""
-    rows = db.query(
-        "SELECT st.track_id, t.title, a.name AS artist_name "
-        "FROM spotify_saved_tracks st "
-        "JOIN tracks t ON t.id = st.track_id "
-        "JOIN artists a ON a.id = t.artist_id "
-        "ORDER BY st.added_at DESC LIMIT ?",
-        (limit,),
-    )
+def download_saved_tracks(config: Config, db: Database, limit: int | None = None) -> dict[str, Any]:
+    """Download user saved (Liked) tracks. If limit is None or <= 0, downloads all liked tracks."""
+    if limit and limit > 0:
+        rows = db.query(
+            "SELECT st.track_id, t.title, a.name AS artist_name "
+            "FROM spotify_saved_tracks st "
+            "JOIN tracks t ON t.id = st.track_id "
+            "JOIN artists a ON a.id = t.artist_id "
+            "ORDER BY st.added_at DESC LIMIT ?",
+            (limit,),
+        )
+    else:
+        rows = db.query(
+            "SELECT st.track_id, t.title, a.name AS artist_name "
+            "FROM spotify_saved_tracks st "
+            "JOIN tracks t ON t.id = st.track_id "
+            "JOIN artists a ON a.id = t.artist_id "
+            "ORDER BY st.added_at DESC",
+        )
     total = len(rows)
     activity.start_operation(
         action="download",
         description=f"Downloading {total} Liked Songs",
         total=total,
+    )
+    activity.log(
+        level="info",
+        category="download",
+        message=f"Starting download of {total} Liked Songs…",
     )
     downloaded = 0
     skipped = 0
@@ -449,7 +513,7 @@ def download_saved_tracks(config: Config, db: Database, limit: int = 25) -> dict
         activity.update_progress(
             current=idx,
             total=total,
-            current_item=f"{row['title']} — {row['artist_name']}",
+            current_item=f"({idx}/{total}) {row['title']} — {row['artist_name']}",
         )
         res = download_track(config, db, tid)
         if res.get("ok"):
@@ -460,8 +524,74 @@ def download_saved_tracks(config: Config, db: Database, limit: int = 25) -> dict
         else:
             errors.append(f"Track {tid} ({row['title']}): {res.get('error')}")
 
+    export_saved_tracks_m3u(config, db)
+
     activity.finish_operation(
         summary=f"Liked songs complete: {downloaded} downloaded, {skipped} skipped, {len(errors)} failed"
+    )
+    activity.log(
+        level="success",
+        category="download",
+        message=f"✓ Liked songs complete: {downloaded} downloaded, {skipped} skipped, {len(errors)} failed",
+    )
+    return {
+        "ok": True,
+        "total": total,
+        "downloaded": downloaded,
+        "skipped": skipped,
+        "errors": errors,
+    }
+
+
+def download_tracks_batch(config: Config, db: Database, track_ids: list[int]) -> dict[str, Any]:
+    """Download multiple selected tracks by IDs."""
+    total = len(track_ids)
+    if not total:
+        return {"ok": True, "total": 0, "downloaded": 0, "skipped": 0, "errors": []}
+    activity.start_operation(
+        action="download",
+        description=f"Downloading {total} selected tracks",
+        total=total,
+    )
+    activity.log(
+        level="info",
+        category="download",
+        message=f"Starting batch download of {total} selected tracks…",
+    )
+    downloaded = 0
+    skipped = 0
+    errors: list[str] = []
+
+    for idx, tid in enumerate(track_ids, 1):
+        t_row = db.one(
+            "SELECT t.title, a.name AS artist_name FROM tracks t JOIN artists a ON a.id = t.artist_id WHERE t.id = ?",
+            (tid,),
+        )
+        title = t_row["title"] if t_row else f"Track #{tid}"
+        artist = t_row["artist_name"] if t_row else "Unknown"
+        activity.update_progress(
+            current=idx,
+            total=total,
+            current_item=f"({idx}/{total}) {title} — {artist}",
+        )
+        res = download_track(config, db, tid)
+        if res.get("ok"):
+            if res.get("already_downloaded"):
+                skipped += 1
+            else:
+                downloaded += 1
+        else:
+            errors.append(f"Track {tid} ({title}): {res.get('error')}")
+
+    export_all_playlists(config, db)
+
+    activity.finish_operation(
+        summary=f"Batch track download complete: {downloaded} downloaded, {skipped} skipped, {len(errors)} failed"
+    )
+    activity.log(
+        level="success",
+        category="download",
+        message=f"✓ Batch track download complete: {downloaded} downloaded, {skipped} skipped, {len(errors)} failed",
     )
     return {
         "ok": True,

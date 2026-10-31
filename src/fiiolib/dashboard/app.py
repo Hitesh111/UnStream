@@ -448,9 +448,18 @@ def create_app(config: Config, db: Database) -> FastAPI:
         return {"ok": True, "exported": len(exported), "playlists": exported}
 
     @app.post("/api/actions/download-saved")
-    def action_download_saved(limit: int = Query(default=20)) -> dict[str, Any]:
+    def action_download_saved(limit: int = Query(default=0)) -> dict[str, Any]:
         from fiiolib.downloads.downloader import download_saved_tracks
-        return download_saved_tracks(config, db, limit=limit)
+        lim = limit if limit > 0 else None
+        return download_saved_tracks(config, db, limit=lim)
+
+    @app.post("/api/actions/download-tracks-batch")
+    def action_download_tracks_batch(track_ids: str = Query(...)) -> dict[str, Any]:
+        from fiiolib.downloads.downloader import download_tracks_batch
+        tids = [int(x.strip()) for x in track_ids.split(",") if x.strip().isdigit()]
+        if not tids:
+            return {"ok": False, "error": "No valid track IDs provided"}
+        return download_tracks_batch(config, db, tids)
 
     @app.post("/api/actions/spotify-sync")
     def action_spotify_sync() -> dict[str, Any]:
@@ -1043,8 +1052,10 @@ input[type="checkbox"] { cursor: pointer; }
             <input type="checkbox" id="chk-song-downloaded-only" onchange="onSongDownloadedFilterChange()"> Only show downloaded (local disk)
           </label>
         </div>
-        <div style="display:flex; align-items:center; gap:8px;">
-          <button class="btn-sm primary" id="btn-dl-saved-batch" onclick="downloadSavedBatch(this)" style="display:none;">⬇ Download Top 20 Liked Songs</button>
+        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+          <span id="songs-selected-counter" style="font-size: 11px; color: var(--accent); font-weight: 600;"></span>
+          <button class="btn-sm primary" id="btn-dl-selected-songs" onclick="downloadSelectedSongs(this)" disabled style="display:none;">⬇ Download Selected</button>
+          <button class="btn-sm primary" id="btn-dl-saved-all" onclick="downloadSavedAll(this)" style="display:none;">⬇ Download All Liked Songs</button>
           <button class="btn-sm" id="btn-song-prev" onclick="changeSongPage(-1)" disabled>◀ Previous</button>
           <span id="song-page-indicator" style="font-size:11px; color:var(--muted); font-variant-numeric:tabular-nums;">Page 1 of 1</span>
           <button class="btn-sm" id="btn-song-next" onclick="changeSongPage(1)" disabled>Next ▶</button>
@@ -1054,6 +1065,7 @@ input[type="checkbox"] { cursor: pointer; }
         <table id="songs-table">
           <thead>
             <tr>
+              <th style="width: 32px;"><input type="checkbox" id="select-all-songs" onchange="toggleSelectAllSongs(this)" title="Select/Deselect All Songs on Page"></th>
               <th style="width: 44px;">#</th>
               <th>Song Title</th>
               <th>Artist</th>
@@ -1064,7 +1076,7 @@ input[type="checkbox"] { cursor: pointer; }
             </tr>
           </thead>
           <tbody id="songs-body">
-            <tr><td colspan="7" class="empty-msg">Loading songs…</td></tr>
+            <tr><td colspan="8" class="empty-msg">Loading songs…</td></tr>
           </tbody>
         </table>
       </div>
@@ -1348,6 +1360,8 @@ async function refreshAll() {
 }
 
 let selectedPlaylistIds = new Set();
+let selectedSongIds = new Set();
+let currentSongsList = [];
 let downloadedFilesData = [];
 
 async function switchBrowserTab(tab) {
@@ -1360,22 +1374,26 @@ async function switchBrowserTab(tab) {
   const songsView = document.getElementById("tab-view-songs");
   const dlView = document.getElementById("tab-view-downloaded");
   const filterInput = document.getElementById("browser-filter-input");
-  const btnDlSaved = document.getElementById("btn-dl-saved-batch");
+  const btnDlSavedAll = document.getElementById("btn-dl-saved-all");
+  const btnDlSelected = document.getElementById("btn-dl-selected-songs");
   filterInput.value = "";
   songFilterQuery = "";
+  selectedSongIds.clear();
+  updateSongSelectionUI();
 
   if (tab === "playlists") {
     plView.style.display = "block";
     songsView.style.display = "none";
     if (dlView) dlView.style.display = "none";
-    if (btnDlSaved) btnDlSaved.style.display = "none";
+    if (btnDlSavedAll) btnDlSavedAll.style.display = "none";
+    if (btnDlSelected) btnDlSelected.style.display = "none";
     filterInput.placeholder = "Filter playlists by name or curator…";
     loadPlaylists();
   } else if (tab === "saved") {
     plView.style.display = "none";
     songsView.style.display = "block";
     if (dlView) dlView.style.display = "none";
-    if (btnDlSaved) btnDlSaved.style.display = "inline-flex";
+    if (btnDlSavedAll) btnDlSavedAll.style.display = "inline-flex";
     filterInput.placeholder = "Filter liked songs…";
     document.getElementById("songs-count-label").textContent = "Showing Spotify Liked Songs";
     currentSongPage = 1;
@@ -1384,7 +1402,7 @@ async function switchBrowserTab(tab) {
     plView.style.display = "none";
     songsView.style.display = "block";
     if (dlView) dlView.style.display = "none";
-    if (btnDlSaved) btnDlSaved.style.display = "none";
+    if (btnDlSavedAll) btnDlSavedAll.style.display = "none";
     filterInput.placeholder = "Filter all songs by title, artist, or album…";
     document.getElementById("songs-count-label").textContent = "Showing All Library Songs";
     currentSongPage = 1;
@@ -1393,7 +1411,8 @@ async function switchBrowserTab(tab) {
     plView.style.display = "none";
     songsView.style.display = "none";
     if (dlView) dlView.style.display = "block";
-    if (btnDlSaved) btnDlSaved.style.display = "none";
+    if (btnDlSavedAll) btnDlSavedAll.style.display = "none";
+    if (btnDlSelected) btnDlSelected.style.display = "none";
     filterInput.placeholder = "Filter downloaded songs by title, artist, or album…";
     loadDownloadedFiles();
   }
@@ -1584,10 +1603,10 @@ async function loadSongs() {
   const onlyDl = document.getElementById("chk-song-downloaded-only") ? document.getElementById("chk-song-downloaded-only").checked : false;
   const data = await safeFetch(`/api/songs?category=${category}&only_downloaded=${onlyDl ? "true" : "false"}&q=${encodeURIComponent(q)}&page=${currentSongPage}&page_size=50`);
   if (!data || data.error) {
-    tbody.innerHTML = `<tr><td colspan="7" class="empty-msg">Error loading songs: ${data ? data.error : "network"}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="8" class="empty-msg">Error loading songs: ${data ? data.error : "network"}</td></tr>`;
     return;
   }
-  const songs = data.songs || [];
+  currentSongsList = data.songs || [];
   totalSongPages = data.total_pages || 1;
   document.getElementById("song-page-indicator").textContent = `Page ${data.page} of ${totalSongPages} (${fmt(data.total)} songs)`;
   document.getElementById("btn-song-prev").disabled = data.page <= 1;
@@ -1601,25 +1620,68 @@ async function loadSongs() {
     document.getElementById("songs-count-label").textContent = `Showing ${fmt(data.total)} Library Songs${onlyDl ? " (Downloaded Only)" : ""}`;
   }
 
-  if (!songs.length) {
-    tbody.innerHTML = `<tr><td colspan="7" class="empty-msg">No songs found matching query</td></tr>`;
+  if (!currentSongsList.length) {
+    tbody.innerHTML = `<tr><td colspan="8" class="empty-msg">No songs found matching query</td></tr>`;
+    updateSongSelectionUI();
     return;
   }
 
   const offset = (data.page - 1) * 50;
-  tbody.innerHTML = songs.map((s, idx) => `
-    <tr>
-      <td style="color:var(--muted);">${offset + idx + 1}</td>
-      <td><b>${escapeHtml(s.title)}</b></td>
-      <td>${escapeHtml(s.artist_name)}</td>
-      <td>${escapeHtml(s.album_title)}</td>
-      <td style="text-align:right;">${msToMin(s.duration_ms)}</td>
-      <td>${s.validated ? '<span class="badge ok">✓ On Disk / Ready</span>' : (s.path ? '<span class="badge sync">Local Matched</span>' : '<span class="badge">Spotify Cloud</span>')}</td>
-      <td>
-        ${s.validated ? '<span class="badge ok">✓ Ready</span>' : `<button class="btn-sm" onclick="downloadSongRow(${s.id}, this)">⬇ Download</button>`}
-      </td>
-    </tr>
-  `).join("");
+  tbody.innerHTML = currentSongsList.map((s, idx) => {
+    const isChecked = selectedSongIds.has(s.id);
+    const isReady = !!s.validated;
+    return `
+      <tr>
+        <td onclick="event.stopPropagation()">
+          <input type="checkbox" data-song-id="${s.id}" ${isChecked ? "checked" : ""} onchange="onSongSelectChange(${s.id}, this.checked)">
+        </td>
+        <td style="color:var(--muted);">${offset + idx + 1}</td>
+        <td><b>${escapeHtml(s.title)}</b></td>
+        <td>${escapeHtml(s.artist_name)}</td>
+        <td>${escapeHtml(s.album_title)}</td>
+        <td style="text-align:right;">${msToMin(s.duration_ms)}</td>
+        <td>${isReady ? '<span class="badge ok">✓ On Disk / Ready</span>' : (s.path ? '<span class="badge sync">Local Matched</span>' : '<span class="badge">Spotify Cloud</span>')}</td>
+        <td>
+          ${isReady ? '<span class="badge ok">✓ Ready</span>' : `<button class="btn-sm" onclick="downloadSongRow(${s.id}, this)">⬇ Download</button>`}
+        </td>
+      </tr>
+    `;
+  }).join("");
+  updateSongSelectionUI();
+}
+
+function onSongSelectChange(id, checked) {
+  if (checked) {
+    selectedSongIds.add(id);
+  } else {
+    selectedSongIds.delete(id);
+  }
+  updateSongSelectionUI();
+}
+
+function toggleSelectAllSongs(master) {
+  if (master.checked) {
+    currentSongsList.forEach(s => selectedSongIds.add(s.id));
+  } else {
+    selectedSongIds.clear();
+  }
+  loadSongs();
+}
+
+function updateSongSelectionUI() {
+  const count = selectedSongIds.size;
+  const counter = document.getElementById("songs-selected-counter");
+  const btnSelected = document.getElementById("btn-dl-selected-songs");
+  const master = document.getElementById("select-all-songs");
+  if (counter) counter.textContent = count ? `(${count} songs selected)` : "";
+  if (btnSelected) {
+    btnSelected.disabled = count === 0;
+    btnSelected.style.display = count > 0 ? "inline-flex" : "none";
+  }
+  if (master && currentSongsList.length > 0) {
+    master.checked = count === currentSongsList.length && count > 0;
+    master.indeterminate = count > 0 && count < currentSongsList.length;
+  }
 }
 
 function onSongDownloadedFilterChange() {
@@ -1794,18 +1856,19 @@ async function downloadCurrentPlaylist(btn) {
   }
 }
 
-async function downloadSavedBatch(btn) {
+async function downloadSavedAll(btn) {
+  if (!confirm("Download ALL Spotify Liked Songs into your local FLAC music library?")) return;
   if (btn) {
     btn.disabled = true;
-    btn.textContent = "⏳ Downloading…";
+    btn.textContent = "⏳ Downloading All Liked…";
   }
-  showToast("Downloading your top Liked Songs…");
+  showToast("Downloading all Spotify Liked Songs…");
   pollActivity();
   try {
-    const res = await fetch("/api/actions/download-saved?limit=20", { method: "POST" });
+    const res = await fetch("/api/actions/download-saved?limit=0", { method: "POST" });
     const data = await res.json();
     if (data.ok) {
-      showToast(`Liked songs complete: ${data.downloaded} new tracks downloaded, ${data.skipped} already present!`);
+      showToast(`All Liked Songs completed: ${data.downloaded} new tracks downloaded, ${data.skipped} already present!`);
       loadSongs();
       refreshAll();
     } else {
@@ -1816,11 +1879,44 @@ async function downloadSavedBatch(btn) {
   } finally {
     if (btn) {
       btn.disabled = false;
-      btn.textContent = "⬇ Download Top 20 Liked Songs";
+      btn.textContent = "⬇ Download All Liked Songs";
     }
     pollActivity();
   }
 }
+
+async function downloadSelectedSongs(btn) {
+  const ids = Array.from(selectedSongIds);
+  if (!ids.length) return;
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "⏳ Downloading Selected…";
+  }
+  showToast(`Downloading ${ids.length} selected tracks in FLAC…`);
+  pollActivity();
+  try {
+    const res = await fetch(`/api/actions/download-tracks-batch?track_ids=${ids.join(",")}`, { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      showToast(`Batch completed: ${data.downloaded} new tracks downloaded, ${data.skipped} already present!`);
+      selectedSongIds.clear();
+      loadSongs();
+      refreshAll();
+    } else {
+      showToast("Download error: " + (data.error || "failed"), true);
+    }
+  } catch (err) {
+    showToast("Error: " + err.message, true);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "⬇ Download Selected";
+    }
+    pollActivity();
+  }
+}
+
+const downloadSavedBatch = downloadSavedAll;
 
 let lastActivityId = 0;
 let isAutoScrollEnabled = true;

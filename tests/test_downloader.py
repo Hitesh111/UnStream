@@ -98,3 +98,41 @@ def test_export_playlist_m3u(config: Config, db: Database, tmp_path: Path) -> No
     exported = export_all_playlists(config, db, target_dir=tmp_path)
     assert len(exported) >= 1
 
+
+def test_download_saved_tracks_unlimited(config: Config, db: Database, tmp_path: Path) -> None:
+    from fiiolib.downloads.downloader import download_saved_tracks
+
+    artist_id = repo.get_or_create_artist(db, "Echo Artist")
+    album_id = repo.get_or_create_album(db, "Echo Album", artist_id=artist_id)
+    t1 = repo.get_or_create_track(db, "Liked Track 1", artist_id=artist_id, album_id=album_id)
+    t2 = repo.get_or_create_track(db, "Liked Track 2", artist_id=artist_id, album_id=album_id)
+
+    cur = db.conn.cursor()
+    cur.execute("INSERT INTO spotify_saved_tracks (track_id, added_at) VALUES (?, datetime('now'))", (t1,))
+    cur.execute("INSERT INTO spotify_saved_tracks (track_id, added_at) VALUES (?, datetime('now'))", (t2,))
+    db.conn.commit()
+
+    with patch("fiiolib.downloads.downloader.download_track") as mock_dl:
+        mock_dl.return_value = {"ok": True, "already_downloaded": True}
+        res = download_saved_tracks(config, db, limit=None)
+        assert res["ok"] is True
+        assert res["total"] == 2
+        assert mock_dl.call_count == 2
+
+
+def test_download_tracks_batch(config: Config, db: Database) -> None:
+    from fiiolib.downloads.downloader import download_tracks_batch
+
+    artist_id = repo.get_or_create_artist(db, "Batch Artist")
+    album_id = repo.get_or_create_album(db, "Batch Album", artist_id=artist_id)
+    t1 = repo.get_or_create_track(db, "Batch Track 1", artist_id=artist_id, album_id=album_id)
+    t2 = repo.get_or_create_track(db, "Batch Track 2", artist_id=artist_id, album_id=album_id)
+
+    with patch("fiiolib.downloads.downloader.download_track") as mock_dl:
+        mock_dl.return_value = {"ok": True, "already_downloaded": False}
+        res = download_tracks_batch(config, db, [t1, t2])
+        assert res["ok"] is True
+        assert res["total"] == 2
+        assert res["downloaded"] == 2
+        assert mock_dl.call_count == 2
+
