@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -18,6 +19,45 @@ from fiiolib.metadata.artwork import prepare_artwork
 from fiiolib.metadata.tagger import TrackMetadata, write_tags
 
 logger = logging.getLogger(__name__)
+
+
+def build_search_queries(artist: str, title: str, album: str | None = None) -> list[str]:
+    """Build prioritised search queries for YouTube audio acquisition with fallbacks."""
+    queries: list[str] = []
+
+    # 1. Standard format: artist - title audio
+    queries.append(f"ytsearch1:{artist} - {title} audio")
+
+    # 2. Flexible format without punctuation or 'audio' suffix
+    queries.append(f"ytsearch1:{artist} {title}")
+    queries.append(f"ytsearch1:{title} {artist}")
+
+    # 3. Cleaned title without parenthetical or bracketed notes (e.g. (Remastered), [Official Audio])
+    clean_title = re.sub(r"[\(\[].*?[\)\]]", "", title).strip()
+    clean_title = re.sub(r"\s+", " ", clean_title)
+    if clean_title and clean_title != title:
+        queries.append(f"ytsearch1:{artist} {clean_title}")
+        queries.append(f"ytsearch1:{clean_title} {artist}")
+
+    # 4. If title has interior periods/dots (e.g. romanized pinyin like uan1h.ing2y.uang1g.in2l.)
+    if "." in title and len(title) > 3:
+        clean_dots = re.sub(r"\s+", " ", title.replace(".", " ")).strip()
+        queries.append(f"ytsearch1:{artist} {clean_dots}")
+        queries.append(f"ytsearch1:{clean_dots}")
+
+    # 5. If album is available and distinct
+    if album and album.strip():
+        queries.append(f"ytsearch1:{artist} {title} {album}")
+
+    # 6. Fallback: title alone
+    queries.append(f"ytsearch1:{title}")
+
+    # Deduplicate while preserving order
+    unique: list[str] = []
+    for q in queries:
+        if q not in unique:
+            unique.append(q)
+    return unique
 
 
 def download_track(config: Config, db: Database, track_id: int) -> dict[str, Any]:
@@ -78,38 +118,67 @@ def download_track(config: Config, db: Database, track_id: int) -> dict[str, Any
     staging_dir = config.root / "staging"
     staging_dir.mkdir(parents=True, exist_ok=True)
     staging_output = staging_dir / f"dl_track_{track_id}.flac"
-    staging_output.unlink(missing_ok=True)
 
-    search_query = f"ytsearch1:{artist} - {title} audio"
-    logger.info("Downloading track #%d: '%s' by '%s'", track_id, title, artist)
+    queries = build_search_queries(artist, title, album)
+    download_success = False
+    last_err = ""
 
-    # Invoke yt-dlp to extract high quality audio and convert to 44.1kHz stereo FLAC
-    cmd = [
-        sys.executable,
-        "-m",
-        "yt_dlp",
-        "--extract-audio",
-        "--audio-format",
-        "flac",
-        "--audio-quality",
-        "0",
-        "--postprocessor-args",
-        "ffmpeg:-ar 44100 -ac 2",
-        "--default-search",
-        "ytsearch",
-        "--max-downloads",
-        "1",
-        "--no-playlist",
-        "--no-warnings",
-        "-o",
-        str(staging_output),
-        search_query,
-    ]
+    for q_idx, search_query in enumerate(queries, 1):
+        staging_output.unlink(missing_ok=True)
+        for old in staging_dir.glob(f"dl_track_{track_id}*"):
+            old.unlink(missing_ok=True)
 
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    # yt-dlp returns 101 when stopping due to --max-downloads 1, which is expected
-    if not staging_output.exists() and proc.returncode not in (0, 101):
-        err = proc.stderr.strip() or proc.stdout.strip() or f"Process returned {proc.returncode}"
+        if q_idx > 1:
+            logger.info("Retrying track #%d with fallback search: '%s'", track_id, search_query)
+            activity.log(
+                level="info",
+                category="download",
+                message=f"Retrying '{title}' with search variation: {search_query[10:]}",
+                track_id=track_id,
+            )
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "yt_dlp",
+            "--extract-audio",
+            "--audio-format",
+            "flac",
+            "--audio-quality",
+            "0",
+            "--postprocessor-args",
+            "ffmpeg:-ar 44100 -ac 2",
+            "--default-search",
+            "ytsearch",
+            "--max-downloads",
+            "1",
+            "--no-playlist",
+            "--no-warnings",
+            "-o",
+            str(staging_output),
+            search_query,
+        ]
+
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+
+        if staging_output.exists():
+            download_success = True
+            break
+
+        candidates = list(staging_dir.glob(f"dl_track_{track_id}*"))
+        if candidates and candidates[0].exists():
+            candidates[0].replace(staging_output)
+            download_success = True
+            break
+
+        err_out = proc.stderr.strip() or proc.stdout.strip()
+        if proc.returncode not in (0, 101) and err_out:
+            last_err = err_out[:200]
+        else:
+            last_err = "No matching audio stream found on YouTube"
+
+    if not download_success:
+        err = last_err or "Downloaded audio stream file was not created"
         logger.error("Download failed for track %d: %s", track_id, err)
         activity.log(
             level="error",
@@ -121,24 +190,6 @@ def download_track(config: Config, db: Database, track_id: int) -> dict[str, Any
             error=err[:200],
         )
         return {"ok": False, "error": f"Download failed: {err[:200]}"}
-
-    if not staging_output.exists():
-        # Sometimes yt-dlp appends .flac
-        candidates = list(staging_dir.glob(f"dl_track_{track_id}*"))
-        if candidates and candidates[0].exists():
-            candidates[0].replace(staging_output)
-        else:
-            err = "Downloaded audio stream file was not created"
-            activity.log(
-                level="error",
-                category="download",
-                message=f"✗ Stream creation failed for '{title}': no output file",
-                track_id=track_id,
-                track_title=title,
-                artist=artist,
-                error=err,
-            )
-            return {"ok": False, "error": err}
 
     activity.log(
         level="info",
