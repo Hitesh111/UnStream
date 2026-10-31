@@ -63,6 +63,16 @@ def test_dashboard_endpoints(config: Config, db: Database) -> None:
     assert "songs" in songs_res.json()
     assert "total" in songs_res.json()
 
+    # Activity monitor endpoints
+    act_res = client.get("/api/activity", headers=headers)
+    assert act_res.status_code == 200
+    assert "logs" in act_res.json()
+    assert "active_operation" in act_res.json()
+    assert "failed_tracks" in act_res.json()
+
+    assert client.post("/api/actions/activity-clear", headers=headers).status_code == 200
+    assert client.post("/api/actions/activity-clear-failures", headers=headers).status_code == 200
+
     assert client.get("/", headers=headers).status_code == 200
 
     blocked = client.get("/api/health", headers={"host": "evil.example"})

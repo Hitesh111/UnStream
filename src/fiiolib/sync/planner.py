@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from fiiolib.activity import activity
 from fiiolib.audio.device_profile import sanitize_component
 from fiiolib.audio.validate import sha256_file
 from fiiolib.config import Config
@@ -283,6 +284,25 @@ class SyncPlanner:
                 (self.register(plan.device), 1 if dry_run else 0, "planned" if dry_run else "running", plan.planned_bytes),
             ).lastrowid
         )
+        total_write_items = len([i for i in plan.items if i.action in {"add", "update"}])
+        if not dry_run:
+            activity.start_operation(
+                action="sync",
+                description=f"Syncing {total_write_items} tracks to {plan.device.volume_name}",
+                total=total_write_items,
+            )
+            activity.log(
+                level="info",
+                category="sync",
+                message=f"Starting microSD card sync to {plan.device.volume_name} ({total_write_items} to copy, {len(plan.items)} total planned)",
+            )
+        else:
+            activity.log(
+                level="info",
+                category="sync",
+                message=f"Sync preview computed: {len(plan.items)} files ({total_write_items} to write, {plan.planned_bytes // (1024*1024)} MB)",
+            )
+
         result = {
             "run_id": run_id,
             "dry_run": dry_run,
@@ -302,6 +322,19 @@ class SyncPlanner:
             if dry_run:
                 self._record_item(run_id, item, "planned")
                 continue
+
+            dest_name = Path(item.relative).name
+            activity.update_progress(
+                current=result["added"] + result["updated"] + 1,
+                total=total_write_items,
+                current_item=item.relative,
+            )
+            activity.log(
+                level="info",
+                category="sync",
+                message=f"Copying '{dest_name}' ({item.size // 1024} KB) to microSD…",
+                track_title=Path(item.relative).stem,
+            )
             try:
                 self._copy_verified(item, verify=verify)
                 self._record_item(run_id, item, "verified" if verify else "copied")
@@ -310,16 +343,34 @@ class SyncPlanner:
                 else:
                     result["updated"] += 1
                 result["verified"] += 1 if verify else 0
+                activity.log(
+                    level="success",
+                    category="sync",
+                    message=f"✓ Verified on card: '{dest_name}' (SHA-256 match)",
+                    track_title=Path(item.relative).stem,
+                )
             except Exception as exc:
                 logger.exception("Sync failed for %s", item.source)
                 result["errors"].append(f"{item.relative}: {exc}")
                 self._record_item(run_id, item, "failed", error=str(exc))
+                activity.log(
+                    level="error",
+                    category="sync",
+                    message=f"✗ Card write failed for '{dest_name}': {exc}",
+                    track_title=Path(item.relative).stem,
+                    error=str(exc),
+                )
 
         if not dry_run and not result["errors"]:
             result["albums_synced"] = self._mark_albums_synced(plan)
             # macOS automatically creates AppleDouble ._* files on FAT/exFAT volumes,
             # which confuse the Echo Mini display. Clean them automatically after sync.
             if sys.platform == "darwin" and shutil.which("dot_clean"):
+                activity.log(
+                    level="info",
+                    category="sync",
+                    message="Running macOS dot_clean to merge AppleDouble resource fork files…",
+                )
                 try:
                     music_dir = plan.device.mount_point / "Music"
                     if music_dir.exists():
@@ -331,6 +382,16 @@ class SyncPlanner:
                         )
                 except Exception:
                     pass
+
+        if not dry_run:
+            activity.finish_operation(
+                summary=f"Card sync complete: {result['added']} added, {len(result['errors'])} failed"
+            )
+            activity.log(
+                level="success" if not result["errors"] else "warn",
+                category="sync",
+                message=f"Card sync finished: {result['added']} files written, {result['skipped']} skipped, {len(result['errors'])} errors",
+            )
         self.db.execute(
             "UPDATE sync_runs SET finished_at = ?, status = ?, added = ?, updated = ?, skipped = ?, "
             "copied_bytes = ?, errors = ? WHERE id = ?",

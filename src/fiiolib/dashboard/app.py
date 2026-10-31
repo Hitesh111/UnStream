@@ -277,25 +277,42 @@ def create_app(config: Config, db: Database) -> FastAPI:
 
     @app.post("/api/actions/sync")
     def action_sync(dry_run: bool = Query(default=True)) -> dict[str, Any]:
+        from fiiolib.activity import activity
         try:
             planner = SyncPlanner(config, db)
             plan = planner.plan()
             if not dry_run and plan.fits:
                 result = planner.execute(plan, dry_run=False)
                 return {"ok": True, "action": "sync", "result": result}
+            else:
+                total_write = len([i for i in plan.items if i.action in {"add", "update"}])
+                activity.log(
+                    level="info",
+                    category="sync",
+                    message=f"Sync preview: {len(plan.items)} tracks checked ({total_write} to write, {len([i for i in plan.items if i.action == 'skip'])} already verified on card)",
+                )
             return {"ok": True, "action": "plan", "plan": plan.as_dict()}
         except Exception as exc:
             logger.exception("Dashboard sync action failed")
+            activity.log(level="error", category="sync", message=f"Sync plan failed: {exc}", error=str(exc))
             return {"ok": False, "error": str(exc)}
 
     @app.post("/api/actions/scan")
     def action_scan() -> dict[str, Any]:
+        from fiiolib.activity import activity
         try:
+            activity.log(level="info", category="system", message="Starting library scan of audio files…")
             scanner = LibraryScanner(config, db)
             summary = scanner.scan()
+            activity.log(
+                level="success",
+                category="system",
+                message=f"Library scan complete: {summary.scanned} files inspected, {summary.new} new, {summary.errors} errors",
+            )
             return {"ok": True, "summary": summary.as_dict()}
         except Exception as exc:
             logger.exception("Dashboard scan action failed")
+            activity.log(level="error", category="system", message=f"Library scan error: {exc}", error=str(exc))
             return {"ok": False, "error": str(exc)}
 
     @app.post("/api/actions/approve")
@@ -386,6 +403,23 @@ def create_app(config: Config, db: Database) -> FastAPI:
             return {"ok": False, "error": str(exc)}
         finally:
             client.close()
+
+    @app.get("/api/activity")
+    def get_activity_logs(since_id: int = Query(default=0)) -> dict[str, Any]:
+        from fiiolib.activity import activity
+        return activity.get_state(since_id=since_id)
+
+    @app.post("/api/actions/activity-clear")
+    def clear_activity_logs() -> dict[str, Any]:
+        from fiiolib.activity import activity
+        activity.clear_logs()
+        return {"ok": True}
+
+    @app.post("/api/actions/activity-clear-failures")
+    def clear_activity_failures() -> dict[str, Any]:
+        from fiiolib.activity import activity
+        activity.clear_failures()
+        return {"ok": True}
 
     @app.exception_handler(DeviceError)
     def device_error(_: Request, exc: DeviceError) -> JSONResponse:
@@ -698,6 +732,79 @@ input[type="checkbox"] { cursor: pointer; }
   from { opacity: 0; transform: scale(0.98); }
   to { opacity: 1; transform: scale(1); }
 }
+
+/* Live Activity & Log Monitor */
+.log-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 3px;
+  line-height: 1.5;
+}
+.log-time {
+  color: #64748b;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+.log-cat {
+  color: #818cf8;
+  font-size: 11px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.log-badge {
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-weight: 700;
+  text-transform: uppercase;
+  flex-shrink: 0;
+  letter-spacing: 0.04em;
+}
+.log-badge.info { background: rgba(56, 189, 248, 0.15); color: #38bdf8; }
+.log-badge.success { background: rgba(52, 211, 153, 0.15); color: #34d399; }
+.log-badge.warn { background: rgba(251, 191, 36, 0.15); color: #fbbf24; }
+.log-badge.error { background: rgba(248, 113, 113, 0.2); color: #f87171; }
+.log-msg {
+  color: #cbd5e1;
+  word-break: break-word;
+}
+.log-msg.success { color: #86efac; font-weight: 500; }
+.log-msg.error { color: #fca5a5; font-weight: 500; }
+.log-msg.warn { color: #fde047; }
+@keyframes pulseGlow {
+  0% { opacity: 0.5; }
+  50% { opacity: 1; }
+  100% { opacity: 0.5; }
+}
+.pulsing-dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+  margin-right: 5px;
+}
+.pulsing-dot.active {
+  background: var(--accent);
+  animation: pulseGlow 1.2s infinite ease-in-out;
+}
+.pulsing-dot.ready {
+  background: var(--good);
+}
+.failed-track-card {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  background: rgba(248, 113, 113, 0.06);
+  border: 1px solid rgba(248, 113, 113, 0.25);
+  border-radius: 5px;
+  font-size: 12px;
+  gap: 12px;
+  flex-wrap: wrap;
+}
 </style>
 </head>
 <body>
@@ -761,6 +868,48 @@ input[type="checkbox"] { cursor: pointer; }
   <section>
     <div class="sec-head"><h2>Pipeline & Safety</h2></div>
     <div id="pipeline">Loading…</div>
+  </section>
+
+  <!-- Live Activity, Sync & Download Execution Monitor -->
+  <section class="full-width" id="activity-monitor-section">
+    <div class="sec-head">
+      <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+        <h2>Live Activity & Execution Monitor</h2>
+        <span id="activity-status-badge" class="badge ok"><span class="pulsing-dot ready" id="activity-pulse"></span>Idle</span>
+        <span id="activity-task-desc" style="font-size:12px; color:var(--fg); font-weight:500;">Ready for acquisition and sync</span>
+      </div>
+      <div class="sec-head-actions">
+        <button class="btn-sm" id="btn-autoscroll" onclick="toggleAutoScroll()">Auto-scroll: ON</button>
+        <button class="btn-sm" onclick="clearActivityLogs()">Clear Console</button>
+      </div>
+    </div>
+
+    <!-- Active Task Progress Bar -->
+    <div id="activity-progress-wrap" style="display:none; margin-bottom:12px; padding:10px 14px; background:#0c121c; border:1px solid var(--line); border-radius:6px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; flex-wrap:wrap; gap:8px;">
+        <span id="activity-progress-label" style="font-size:12px; font-weight:600; color:var(--accent);">Processing…</span>
+        <span id="activity-progress-ratio" style="font-size:11px; color:var(--muted); font-variant-numeric:tabular-nums;">0 / 0</span>
+      </div>
+      <div style="width:100%; height:4px; background:#1e293b; border-radius:2px; overflow:hidden;">
+        <div id="activity-progress-bar" style="width:0%; height:100%; background:var(--accent); transition:width 0.25s ease;"></div>
+      </div>
+    </div>
+
+    <!-- Failed Tracks Alert & Retry Box -->
+    <div id="activity-failures-panel" style="display:none; margin-bottom:12px; padding:12px 14px; background:rgba(248,113,113,0.08); border:1px solid rgba(248,113,113,0.3); border-radius:6px;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+        <span style="font-size:12px; font-weight:600; color:var(--bad); display:flex; align-items:center; gap:6px;">
+          <span>⚠️</span> <span id="failures-count-label">0 Failed Tracks</span>
+        </span>
+        <button class="btn-sm" onclick="clearActivityFailures()" style="border-color:rgba(248,113,113,0.4); color:var(--bad);">✕ Dismiss All Failures</button>
+      </div>
+      <div id="failures-list" style="display:flex; flex-direction:column; gap:6px;"></div>
+    </div>
+
+    <!-- Scrollable Terminal Log Console -->
+    <div id="activity-console" style="height:230px; overflow-y:auto; background:#070a0f; border:1px solid var(--line); border-radius:6px; padding:12px 14px; font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size:11.5px; line-height:1.6; color:#94a3b8;">
+      <div class="empty-msg">Waiting for activity events…</div>
+    </div>
   </section>
 
   <!-- Spotify Library Browser (Playlists & Songs) -->
@@ -936,6 +1085,7 @@ const fmt = n => n == null ? "-" : new Intl.NumberFormat().format(n);
 const gb = n => (n == null || isNaN(n)) ? "0.00 GB" : (n/1024/1024/1024).toFixed(2) + " GB";
 const msToMin = ms => ms ? (Math.floor(ms/60000) + ":" + String(Math.floor((ms%60000)/1000)).padStart(2,"0")) : "-";
 const kv = (label, value, cls="") => `<div class="kv"><span>${label}</span><b class="${cls}">${value}</b></div>`;
+const escapeHtml = str => String(str || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
 let allCurrentCandidates = [];
 let selectedCandidateIds = new Set();
@@ -1268,6 +1418,7 @@ async function downloadSongRow(trackId, btn) {
     btn.textContent = "⏳ Downloading…";
   }
   showToast(`Downloading track #${trackId} via yt-dlp & FFmpeg…`);
+  pollActivity();
   try {
     const res = await fetch(`/api/actions/download-track?track_id=${trackId}`, { method: "POST" });
     const data = await res.json();
@@ -1290,6 +1441,8 @@ async function downloadSongRow(trackId, btn) {
       btn.disabled = false;
       btn.textContent = "⬇ Retry";
     }
+  } finally {
+    pollActivity();
   }
 }
 
@@ -1300,6 +1453,7 @@ async function downloadCurrentPlaylist(btn) {
     btn.textContent = "⏳ Downloading…";
   }
   showToast("Downloading playlist songs in background…");
+  pollActivity();
   try {
     const res = await fetch(`/api/actions/download-playlist?playlist_id=${currentOpenPlaylistId}&max_tracks=30`, { method: "POST" });
     const data = await res.json();
@@ -1317,6 +1471,7 @@ async function downloadCurrentPlaylist(btn) {
       btn.disabled = false;
       btn.textContent = "⬇ Download Playlist";
     }
+    pollActivity();
   }
 }
 
@@ -1326,6 +1481,7 @@ async function downloadSavedBatch(btn) {
     btn.textContent = "⏳ Downloading…";
   }
   showToast("Downloading your top Liked Songs…");
+  pollActivity();
   try {
     const res = await fetch("/api/actions/download-saved?limit=20", { method: "POST" });
     const data = await res.json();
@@ -1342,6 +1498,148 @@ async function downloadSavedBatch(btn) {
     if (btn) {
       btn.disabled = false;
       btn.textContent = "⬇ Download Top 20 Liked Songs";
+    }
+    pollActivity();
+  }
+}
+
+let lastActivityId = 0;
+let isAutoScrollEnabled = true;
+
+function toggleAutoScroll() {
+  isAutoScrollEnabled = !isAutoScrollEnabled;
+  const btn = document.getElementById("btn-autoscroll");
+  if (btn) btn.textContent = isAutoScrollEnabled ? "Auto-scroll: ON" : "Auto-scroll: OFF";
+  if (isAutoScrollEnabled) {
+    const consoleEl = document.getElementById("activity-console");
+    if (consoleEl) consoleEl.scrollTop = consoleEl.scrollHeight;
+  }
+}
+
+async function clearActivityLogs() {
+  await safeFetch("/api/actions/activity-clear", { method: "POST" });
+  const consoleEl = document.getElementById("activity-console");
+  if (consoleEl) consoleEl.innerHTML = '<div class="empty-msg">Console cleared. Waiting for new activity events…</div>';
+  lastActivityId = 0;
+}
+
+async function clearActivityFailures() {
+  await safeFetch("/api/actions/activity-clear-failures", { method: "POST" });
+  const panel = document.getElementById("activity-failures-panel");
+  if (panel) panel.style.display = "none";
+}
+
+async function retryFailedTrack(trackId, btn) {
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "⏳ Retrying…";
+  }
+  showToast(`Retrying download for track #${trackId}…`);
+  try {
+    const res = await fetch(`/api/actions/download-track?track_id=${trackId}`, { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      showToast(`Downloaded "${data.title}" successfully!`);
+      pollActivity();
+      refreshAll();
+    } else {
+      showToast("Retry failed: " + (data.error || "error"), true);
+      pollActivity();
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "⬇ Retry";
+      }
+    }
+  } catch (err) {
+    showToast("Error: " + err.message, true);
+    pollActivity();
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "⬇ Retry";
+    }
+  }
+}
+
+async function pollActivity() {
+  const data = await safeFetch(`/api/activity?since_id=${lastActivityId}`);
+  if (!data || data.error) return;
+
+  const badge = document.getElementById("activity-status-badge");
+  const desc = document.getElementById("activity-task-desc");
+  const progressWrap = document.getElementById("activity-progress-wrap");
+  const progressLabel = document.getElementById("activity-progress-label");
+  const progressRatio = document.getElementById("activity-progress-ratio");
+  const progressBar = document.getElementById("activity-progress-bar");
+  const failuresPanel = document.getElementById("activity-failures-panel");
+  const failuresCount = document.getElementById("failures-count-label");
+  const failuresList = document.getElementById("failures-list");
+  const consoleEl = document.getElementById("activity-console");
+
+  if (!badge || !consoleEl) return;
+
+  // 1. Update Active Operation & Progress
+  const active = data.active_operation || {};
+  if (active.status === "running") {
+    badge.className = "badge sync";
+    badge.innerHTML = '<span class="pulsing-dot active"></span>Working';
+    desc.textContent = active.description || "Active operation in progress…";
+    progressWrap.style.display = "block";
+    progressLabel.textContent = (active.current_item ? `Working on: ${active.current_item}` : (active.description || "Processing"));
+    if (active.progress_total > 0) {
+      progressRatio.textContent = `${active.progress_current} / ${active.progress_total}`;
+      const pct = Math.min(100, Math.round((active.progress_current / active.progress_total) * 100));
+      progressBar.style.width = pct + "%";
+    } else {
+      progressRatio.textContent = "";
+      progressBar.style.width = "100%";
+    }
+  } else {
+    badge.className = "badge ok";
+    badge.innerHTML = '<span class="pulsing-dot ready"></span>Idle';
+    desc.textContent = active.description || "System idle";
+    progressWrap.style.display = "none";
+  }
+
+  // 2. Update Failed Tracks Banner
+  const failures = data.failed_tracks || [];
+  if (failures.length > 0) {
+    failuresPanel.style.display = "block";
+    failuresCount.textContent = `${failures.length} Failed Track${failures.length > 1 ? "s" : ""}`;
+    failuresList.innerHTML = failures.map(f => `
+      <div class="failed-track-card">
+        <div>
+          <b style="color:#fff;">${escapeHtml(f.title)}</b> <span style="color:var(--muted);">by ${escapeHtml(f.artist)}</span>
+          <div style="color:var(--bad); font-size:11px; margin-top:2px;"><b>Error:</b> ${escapeHtml(f.error)}</div>
+        </div>
+        <div style="display:flex; align-items:center; gap:8px;">
+          <span style="color:var(--muted); font-size:10px; font-variant-numeric:tabular-nums;">${f.timestamp || ""}</span>
+          ${f.track_id ? `<button class="btn-sm primary" onclick="retryFailedTrack(${f.track_id}, this)">⬇ Retry Download</button>` : ""}
+        </div>
+      </div>
+    `).join("");
+  } else {
+    failuresPanel.style.display = "none";
+  }
+
+  // 3. Append New Logs to Console
+  const logs = data.logs || [];
+  if (logs.length > 0) {
+    if (lastActivityId === 0 && consoleEl.querySelector(".empty-msg")) {
+      consoleEl.innerHTML = "";
+    }
+    const htmlChunks = logs.map(e => `
+      <div class="log-row">
+        <span class="log-time">[${e.timestamp}]</span>
+        <span class="log-cat">[${(e.category || "SYSTEM").toUpperCase()}]</span>
+        <span class="log-badge ${e.level}">${e.level.toUpperCase()}</span>
+        <span class="log-msg ${e.level}">${escapeHtml(e.message)}</span>
+      </div>
+    `).join("");
+    consoleEl.insertAdjacentHTML("beforeend", htmlChunks);
+    lastActivityId = data.last_id || lastActivityId;
+
+    if (isAutoScrollEnabled) {
+      consoleEl.scrollTop = consoleEl.scrollHeight;
     }
   }
 }
@@ -1604,6 +1902,7 @@ async function triggerScan(btn) {
 async function triggerSync(btn, dryRun) {
   btn.disabled = true;
   showToast(dryRun ? "Calculating sync plan for microSD…" : "Syncing files to microSD card…");
+  pollActivity();
   try {
     const res = await fetch(`/api/actions/sync?dry_run=${dryRun ? "true" : "false"}`, { method: "POST" });
     const data = await res.json();
@@ -1622,6 +1921,7 @@ async function triggerSync(btn, dryRun) {
     showToast("Sync error: " + err.message, true);
   } finally {
     btn.disabled = false;
+    pollActivity();
     refreshAll();
   }
 }
@@ -1683,6 +1983,8 @@ async function rejectCandidate(id) {
 
 refreshAll();
 setInterval(refreshAll, 10000);
+pollActivity();
+setInterval(pollActivity, 1500);
 </script>
 </body>
 </html>
