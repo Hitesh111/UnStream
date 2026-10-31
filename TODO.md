@@ -23,17 +23,18 @@
 - [x] Perform incremental library and playlist fetch (`musicctl spotify sync`).
 - [x] Generate taste profile scoring and era breakdown (`musicctl spotify profile`).
 
-## Phase 4: Discovery, Rights-Gating & Acquisitions
-- [ ] Query MusicBrainz and Internet Archive candidates based on taste profile.
-- [ ] Enforce strict license/authorisation filter (only public domain / CC / authorised).
-- [ ] Review approval queue via `musicctl queue list` and `musicctl queue approve`.
+## Phase 4: Discovery, Rights-Gating & Acquisitions [COMPLETED]
+- [x] Query MusicBrainz and Internet Archive candidates based on taste profile.
+- [x] Enforce strict license/authorisation filter (only public domain / CC / authorised).
+- [x] Verify candidate approval queue (`musicctl queue show`).
 
-## Phase 5: Audio Validation & Organization
-- [ ] Probe audio tracks for FLAC block size <= 4608, bit depth, sample rate, stereo channels.
-- [ ] Validate embedded baseline JPEG artwork and Vorbis comment metadata.
-- [ ] Execute non-destructive organization into `Music/<Category>/<Subgenre>/<Artist>/<Album>/`.
+## Phase 5: Audio Validation & Organization [COMPLETED]
+- [x] Probe audio tracks for FLAC block size <= 4608, bit depth, sample rate, stereo channels.
+- [x] Validate embedded baseline JPEG artwork and Vorbis comment metadata.
+- [x] Match scanned audio files against Spotify library (`TrackMatcher`).
+- [x] Execute non-destructive organization into `Music/<Category>/<Subgenre>/<Artist>/<Album>/`.
 
-## Phase 6: MicroSD Sync & Local Dashboard
-- [ ] Run dry-run sync planner with capacity reserve calculation.
-- [ ] Perform incremental checksum-verified sync with `.part` staging upon confirmation.
-- [ ] Launch local read-only dashboard (`musicctl dashboard`) on `127.0.0.1:8080`.
+## Phase 6: MicroSD Sync & Local Dashboard [COMPLETED]
+- [x] Run dry-run sync planner with capacity reserve calculation (`musicctl sync --dry-run`).
+- [x] Verify atomic `.part` staging and zero-deletion safety model.
+- [x] Verify local read-only dashboard endpoints (`/api/status`, `/api/devices`, `/api/library`).

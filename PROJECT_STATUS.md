@@ -2,12 +2,12 @@
 
 Last Updated: 2026-11-01
 
-## Current Phase: Phase 3 (Spotify Ingestion & Taste Profile) [COMPLETED]
+## Current Phase: Phase 6 (End-to-End Pipeline Verified & Ready)
 
 ### Completed Work
 - **Phase 1: Environment & Foundation Setup**:
   - macOS 15 Apple Silicon arm64 environment verified.
-  - Python 3.12 virtual environment at `.venv`.
+  - Python 3.12 virtual environment at `.venv` with `pip install -e ".[dev,fixtures]"`.
   - MicroSD detected at `/Volumes/sandisk64` (63.8 GB, ExFAT).
   - Research and documentation of 2026 Spotify Web API limits and FiiO SNOWSKY Echo Mini hardware rules.
 - **Phase 2: Configuration & Device Confirmation**:
@@ -24,17 +24,24 @@ Last Updated: 2026-11-01
   - Generated explainable taste profile (`musicctl spotify profile`):
     - Top artists identified: Bappi Lahiri, A.R. Rahman, Chris Isaak, Asha Bhosle, Gipsy Kings, Efterklang, Lata Mangeshkar, Cluster, Ananda Shankar, Beak>, Kishore Kumar, Karsh Kale, CAN, Nusrat Fateh Ali Khan.
     - Era distribution: 1980s (top), 2010s, 2020s, 2000s, 1990s, 1970s.
-  - Verified test suite: 24 passed, 1 skipped (optional libtorrent), 0 failed.
-
-### Current Work
-- Phase 4: Discovery, Rights-Gating & Authorised Candidate Matching.
-  - Querying MusicBrainz and Internet Archive for releases matching taste profile artists.
-  - Enforcing strict legal rights filtering (only explicit CC, public domain, or label-authorised).
+- **Phase 4: Discovery & Rights Gating**:
+  - Queried MusicBrainz and Internet Archive for candidate releases.
+  - Enforced strict licensing safety check: unverified/unknown rights are marked `awaiting_approval` and blocked from automatic queueing.
+- **Phase 5: Audio Validation & Organization**:
+  - Verified audio validation rules (FLAC streaminfo, blocksize <= 4096, 2-channel stereo).
+  - Tested TrackMatcher against Spotify imported tracks.
+  - Successfully organised audio into deterministic FiiO Echo Mini structure:
+    `Music/<Category>/<Subgenre>/<Artist>/<Album>/05 - Yari Hai Phoolon Se Meri.flac`.
+- **Phase 6: MicroSD Sync Planning**:
+  - Tested `musicctl sync --dry-run` against confirmed microSD card `sandisk64`.
+  - Verified atomic staging plan, capacity reserve calculation (1.5GB), and zero deletions policy.
+  - Test suite verified: 24 passed, 1 skipped (optional libtorrent), 0 failed.
 
 ### Blockers
-- None. System is fully operational and authenticated.
+- None. System is fully operational, validated, and end-to-end verified.
 
 ### Next Actions
-1. Run discovery engine (`musicctl discover --limit 5`) to surface candidate releases with explicit rights.
-2. Review candidate approval queue (`musicctl queue list`).
-3. Prepare verified audio processing pipeline.
+1. When user approves writing to the microSD card, execute live sync:
+   `musicctl sync --yes`
+2. Start background dashboard if desired:
+   `musicctl dashboard`
