@@ -42,8 +42,17 @@ Last Updated: 2026-11-01
     - ❤️ **Liked Songs (372)**: Filterable and paginated user saved tracks.
     - 🎵 **All Songs (2,028)**: Complete searchable library song index with pagination and card sync status.
   - Global live search integrated with instant playlist, song, artist, and candidate discovery.
-  - Full test suite verified: 24 passed, 1 skipped (optional libtorrent), 0 failed.
+  - Full test suite verified: 27 passed, 1 skipped (optional libtorrent), 0 failed.
+- **Phase 7: Automated Direct Audio Acquisition & Card Sync Pipeline**:
+  - Implemented direct high-quality audio acquisition pipeline in [downloader.py](file:///Users/hiteshkumar/local_music/src/fiiolib/downloads/downloader.py) using `yt-dlp` and `ffmpeg` (version 9.0.2).
+  - Automatically fetches audio, transcodes to 44.1 kHz stereo FLAC, embeds 500x500 baseline JPEG cover art, writes Vorbis comment tags, validates against Echo Mini hardware specifications, and moves into `~/FiiO-Library/music/` via `Organiser`.
+  - Added interactive "⬇ Download" buttons for single songs, full playlists, and Liked Songs batches directly in the dashboard UI at `http://127.0.0.1:8765`.
+  - Added CLI `musicctl download --track <id>`, `--playlist <id>`, and `--saved [--limit <n>]`.
+  - Added automated macOS `dot_clean -m` execution directly in `fiiolib.sync.planner.execute()` to strip and merge all AppleDouble `._*` resource fork files upon writing to the microSD card.
+  - Successfully downloaded, validated, organised, and live-synced 6 FLAC tracks to `/Volumes/sandisk64/Music`.
 
-### Blockers
-- None. System is fully operational and syncing successfully.
+### Current Card State (/Volumes/sandisk64)
+- **Files Synced**: 6 FLAC tracks (Bappi Lahiri, Suleymer, Television Blonde, Minaxi, Adriano Celentano, Lorie Ladd).
+- **AppleDouble Artifacts**: 0 (cleaned automatically).
+- **Free Space**: 59.3 GB (1.5 GB reserve enforced).
 
