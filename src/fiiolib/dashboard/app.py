@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -113,6 +114,54 @@ def create_app(config: Config, db: Database) -> FastAPI:
             ]
         }
 
+    @app.get("/api/search")
+    def search(q: str = Query(default="")) -> dict[str, Any]:
+        query = q.strip()
+        if not query:
+            return {"query": "", "tracks": [], "artists": [], "candidates": []}
+        pattern = f"%{query}%"
+        tracks = [
+            dict(row)
+            for row in db.query(
+                "SELECT t.id, t.title, a.name AS artist_name, al.title AS album_title, "
+                "t.track_number, t.duration_ms, f.validated, f.path "
+                "FROM tracks t "
+                "JOIN artists a ON a.id = t.artist_id "
+                "JOIN albums al ON al.id = t.album_id "
+                "LEFT JOIN files f ON f.track_id = t.id "
+                "WHERE t.title LIKE ? OR a.name LIKE ? OR al.title LIKE ? "
+                "ORDER BY (f.validated IS NOT NULL AND f.validated = 1) DESC, t.id ASC LIMIT 40",
+                (pattern, pattern, pattern),
+            )
+        ]
+        artists = [
+            dict(row)
+            for row in db.query(
+                "SELECT a.id, a.name, COUNT(t.id) AS tracks_count "
+                "FROM artists a "
+                "LEFT JOIN tracks t ON t.artist_id = a.id "
+                "WHERE a.name LIKE ? "
+                "GROUP BY a.id ORDER BY tracks_count DESC LIMIT 20",
+                (pattern,),
+            )
+        ]
+        candidates = [
+            dict(row)
+            for row in db.query(
+                "SELECT c.*, ar.name AS artist_name FROM discovery_candidates c "
+                "LEFT JOIN artists ar ON ar.id = c.artist_id "
+                "WHERE c.entity_name LIKE ? OR ar.name LIKE ? "
+                "ORDER BY c.score DESC LIMIT 25",
+                (pattern, pattern),
+            )
+        ]
+        for c in candidates:
+            try:
+                c["reasons"] = json.loads(c.get("reasons") or "[]")
+            except Exception:
+                c["reasons"] = []
+        return {"query": query, "tracks": tracks, "artists": artists, "candidates": candidates}
+
     @app.post("/api/actions/sync")
     def action_sync(dry_run: bool = Query(default=True)) -> dict[str, Any]:
         try:
@@ -153,6 +202,46 @@ def create_app(config: Config, db: Database) -> FastAPI:
             return {"ok": True, "result": res}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
+
+    @app.post("/api/actions/bulk-approve")
+    def action_bulk_approve(ids: str = Query(...)) -> dict[str, Any]:
+        manager = DownloadManager(config, db)
+        candidate_ids = [int(i.strip()) for i in ids.split(",") if i.strip().isdigit()]
+        results = []
+        for cid in candidate_ids:
+            try:
+                res = manager.approve(cid)
+                results.append({"id": cid, "ok": True, "result": res})
+            except Exception as exc:
+                results.append({"id": cid, "ok": False, "error": str(exc)})
+        return {"ok": True, "count": len(results), "results": results}
+
+    @app.post("/api/actions/bulk-reject")
+    def action_bulk_reject(ids: str = Query(...)) -> dict[str, Any]:
+        manager = DownloadManager(config, db)
+        candidate_ids = [int(i.strip()) for i in ids.split(",") if i.strip().isdigit()]
+        results = []
+        for cid in candidate_ids:
+            try:
+                res = manager.reject(cid)
+                results.append({"id": cid, "ok": True, "result": res})
+            except Exception as exc:
+                results.append({"id": cid, "ok": False, "error": str(exc)})
+        return {"ok": True, "count": len(results), "results": results}
+
+    @app.post("/api/actions/approve-all")
+    def action_approve_all() -> dict[str, Any]:
+        manager = DownloadManager(config, db)
+        rows = db.query("SELECT id FROM discovery_candidates WHERE status = 'awaiting_approval'")
+        results = []
+        for row in rows:
+            cid = int(row["id"])
+            try:
+                res = manager.approve(cid)
+                results.append({"id": cid, "ok": True, "result": res})
+            except Exception as exc:
+                results.append({"id": cid, "ok": False, "error": str(exc)})
+        return {"ok": True, "count": len(results), "results": results}
 
     @app.post("/api/actions/spotify-sync")
     def action_spotify_sync() -> dict[str, Any]:
@@ -255,7 +344,7 @@ header {
 .brand { display: flex; align-items: baseline; gap: 12px; }
 .brand h1 { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -0.01em; color: #fff; }
 .brand span { color: var(--muted); font-size: 12px; }
-.header-actions { display: flex; align-items: center; gap: 8px; }
+.header-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 button {
   background: #1e293b;
   border: 1px solid var(--line-light);
@@ -273,11 +362,49 @@ button {
 button:hover { background: #334155; border-color: var(--accent); }
 button.primary { background: #0284c7; border-color: #38bdf8; color: #fff; }
 button.primary:hover { background: #0369a1; }
-button.danger { background: #7f1d1d; border-color: #ef4444; color: #fecaca; }
-button.danger:hover { background: #991b1b; }
+button.success { background: rgba(52, 211, 153, 0.2); border-color: #34d399; color: #34d399; }
+button.success:hover { background: rgba(52, 211, 153, 0.35); }
+button.danger { background: rgba(248, 113, 113, 0.2); border-color: #f87171; color: #f87171; }
+button.danger:hover { background: rgba(248, 113, 113, 0.35); }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.search-bar-wrap {
+  padding: 14px 28px;
+  background: #0c121c;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+.search-input-box {
+  flex: 1;
+  max-width: 650px;
+  position: relative;
+}
+.search-input-box input {
+  width: 100%;
+  background: #141c2b;
+  border: 1px solid var(--line-light);
+  border-radius: 6px;
+  padding: 8px 12px 8px 34px;
+  color: #fff;
+  font-size: 13px;
+  outline: none;
+}
+.search-input-box input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.15);
+}
+.search-icon {
+  position: absolute;
+  left: 11px;
+  top: 8px;
+  color: var(--muted);
+  font-size: 14px;
+}
+
 #toast {
-  padding: 8px 16px;
+  padding: 10px 16px;
   background: #1e293b;
   border-left: 3px solid var(--accent);
   margin: 12px 28px 0;
@@ -285,6 +412,15 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   font-size: 12px;
   display: none;
 }
+#search-results-panel {
+  display: none;
+  margin: 14px 28px 0;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 16px 20px;
+}
+
 main {
   padding: 20px 28px;
   display: grid;
@@ -309,6 +445,13 @@ section.full-width {
   margin-bottom: 12px;
   border-bottom: 1px solid var(--line);
   padding-bottom: 8px;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.sec-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 h2 {
   margin: 0;
@@ -335,7 +478,7 @@ table {
 }
 td, th {
   text-align: left;
-  padding: 6px 8px;
+  padding: 7px 8px;
   border-bottom: 1px solid #192233;
 }
 th {
@@ -357,6 +500,7 @@ tr:hover td { background: rgba(255,255,255,0.02); }
 .badge.ok { background: rgba(52, 211, 153, 0.15); color: var(--good); border: 1px solid rgba(52, 211, 153, 0.3); }
 .badge.warn { background: rgba(251, 191, 36, 0.15); color: var(--warn); border: 1px solid rgba(251, 191, 36, 0.3); }
 .badge.bad { background: rgba(248, 113, 113, 0.15); color: var(--bad); border: 1px solid rgba(248, 113, 113, 0.3); }
+.badge.sync { background: rgba(56, 189, 248, 0.15); color: var(--accent); border: 1px solid rgba(56, 189, 248, 0.3); }
 .ok { color: var(--good); }
 .warn { color: var(--warn); }
 .bad { color: var(--bad); }
@@ -367,8 +511,9 @@ footer {
   display: flex;
   justify-content: space-between;
 }
-.btn-sm { padding: 3px 8px; font-size: 11px; border-radius: 4px; }
-.empty-msg { color: var(--muted); font-size: 12px; padding: 12px 0; font-style: italic; }
+.btn-sm { padding: 4px 8px; font-size: 11px; border-radius: 4px; }
+.empty-msg { color: var(--muted); font-size: 12px; padding: 14px 0; font-style: italic; }
+input[type="checkbox"] { cursor: pointer; }
 </style>
 </head>
 <body>
@@ -385,6 +530,24 @@ footer {
     <button onclick="refreshAll()">↻ Refresh</button>
   </div>
 </header>
+
+<!-- Global Live Search Bar -->
+<div class="search-bar-wrap">
+  <div class="search-input-box">
+    <span class="search-icon">🔍</span>
+    <input type="text" id="global-search" placeholder="Search artists, songs, albums, and discovery candidates…" oninput="onSearchInput(this.value)">
+  </div>
+  <span style="color:var(--muted); font-size:12px;" id="search-hint">Type to search across Spotify library & candidates</span>
+</div>
+
+<!-- Search Results Dropdown/Panel -->
+<div id="search-results-panel">
+  <div class="sec-head">
+    <h2 id="search-results-title">Search Results</h2>
+    <button class="btn-sm" onclick="closeSearch()">✕ Close</button>
+  </div>
+  <div id="search-results-content"></div>
+</div>
 
 <div id="toast"></div>
 
@@ -416,27 +579,36 @@ footer {
     <div id="pipeline">Loading…</div>
   </section>
 
-  <!-- Candidates with Interactive Action -->
+  <!-- Candidates with Multi-Select and Bulk Actions -->
   <section class="full-width">
     <div class="sec-head">
-      <h2>Discovery Candidates (Awaiting Review)</h2>
-      <span class="badge warn" id="cand-count">0 pending</span>
+      <div>
+        <h2>Discovery Candidates (Awaiting Review)</h2>
+        <span class="badge warn" id="cand-count">0 pending</span>
+        <span id="selection-counter" style="margin-left: 8px; font-size: 11px; color: var(--accent); font-weight: 500;"></span>
+      </div>
+      <div class="sec-head-actions">
+        <button class="btn-sm success" id="btn-approve-selected" onclick="approveSelected()" disabled>✓ Approve Selected</button>
+        <button class="btn-sm danger" id="btn-reject-selected" onclick="rejectSelected()" disabled>✕ Reject Selected</button>
+        <button class="btn-sm primary" onclick="approveAllPending()">✓ Approve All Pending</button>
+      </div>
     </div>
     <div style="overflow-x:auto;">
       <table id="candidates-table">
         <thead>
           <tr>
-            <th>#</th>
+            <th style="width: 32px;"><input type="checkbox" id="select-all-cands" onchange="toggleSelectAll(this)"></th>
+            <th style="width: 50px;">#</th>
             <th>Artist</th>
             <th>Release</th>
             <th>Score</th>
             <th>Licence Rights</th>
             <th>Reason</th>
-            <th>Action</th>
+            <th style="width: 140px;">Action</th>
           </tr>
         </thead>
         <tbody id="candidates-body">
-          <tr><td colspan="7" class="empty-msg">No candidates awaiting review</td></tr>
+          <tr><td colspan="8" class="empty-msg">No candidates awaiting review</td></tr>
         </tbody>
       </table>
     </div>
@@ -469,7 +641,12 @@ footer {
 <script>
 const fmt = n => n == null ? "-" : new Intl.NumberFormat().format(n);
 const gb = n => (n == null || isNaN(n)) ? "0.00 GB" : (n/1024/1024/1024).toFixed(2) + " GB";
+const msToMin = ms => ms ? (Math.floor(ms/60000) + ":" + String(Math.floor((ms%60000)/1000)).padStart(2,"0")) : "-";
 const kv = (label, value, cls="") => `<div class="kv"><span>${label}</span><b class="${cls}">${value}</b></div>`;
+
+let allCurrentCandidates = [];
+let selectedCandidateIds = new Set();
+let searchDebounceTimer = null;
 
 function showToast(msg, isError=false) {
   const el = document.getElementById("toast");
@@ -492,7 +669,6 @@ async function safeFetch(url) {
 async function refreshAll() {
   document.getElementById("stamp").textContent = "refreshing…";
 
-  // Fetch all endpoints with fault isolation
   const [s, lib, dev, syn, cands, auto] = await Promise.all([
     safeFetch("/api/status"),
     safeFetch("/api/library"),
@@ -556,28 +732,10 @@ async function refreshAll() {
       kv("Reserved Capacity", "1.50 GB (Protected)");
   }
 
-  // Candidates Table
-  const candList = (cands && !cands.error) ? (cands.candidates || []) : [];
-  document.getElementById("cand-count").textContent = candList.length + " pending";
-  const candBody = document.getElementById("candidates-body");
-  if (!candList.length) {
-    candBody.innerHTML = `<tr><td colspan="7" class="empty-msg">No candidates awaiting review</td></tr>`;
-  } else {
-    candBody.innerHTML = candList.slice(0, 15).map(c => `
-      <tr>
-        <td><b>#${c.id}</b></td>
-        <td>${c.artist_name || "-"}</td>
-        <td><b>${c.release_title || c.entity_name || "-"}</b></td>
-        <td>${c.score ? c.score.toFixed(1) : "-"}</td>
-        <td><span class="badge ${c.licence ? "ok" : "warn"}">${c.licence || "unverified"}</span></td>
-        <td style="color:var(--muted); font-size:11px;">${(c.reasons || []).map(r => r.code || r.reason).join(", ")}</td>
-        <td>
-          <button class="btn-sm" style="color:var(--good);" onclick="approveCandidate(${c.id})">Approve</button>
-          <button class="btn-sm danger" onclick="rejectCandidate(${c.id})">Reject</button>
-        </td>
-      </tr>
-    `).join("");
-  }
+  // Candidates Table with Checkboxes
+  allCurrentCandidates = (cands && !cands.error) ? (cands.candidates || []) : [];
+  document.getElementById("cand-count").textContent = allCurrentCandidates.length + " pending";
+  renderCandidatesTable();
 
   // Sync Runs
   if (syn && !syn.error) {
@@ -614,6 +772,211 @@ async function refreshAll() {
   document.getElementById("stamp").textContent = "updated " + new Date().toLocaleTimeString();
 }
 
+function renderCandidatesTable() {
+  const candBody = document.getElementById("candidates-body");
+  if (!allCurrentCandidates.length) {
+    candBody.innerHTML = `<tr><td colspan="8" class="empty-msg">No candidates awaiting review</td></tr>`;
+    updateSelectionUI();
+    return;
+  }
+  candBody.innerHTML = allCurrentCandidates.map(c => `
+    <tr>
+      <td><input type="checkbox" data-id="${c.id}" ${selectedCandidateIds.has(c.id) ? "checked" : ""} onchange="onRowSelectChange(${c.id}, this.checked)"></td>
+      <td><b>#${c.id}</b></td>
+      <td>${c.artist_name || "-"}</td>
+      <td><b>${c.release_title || c.entity_name || "-"}</b></td>
+      <td>${c.score ? c.score.toFixed(1) : "-"}</td>
+      <td><span class="badge ${c.licence ? "ok" : "warn"}">${c.licence || "unverified"}</span></td>
+      <td style="color:var(--muted); font-size:11px;">${(c.reasons || []).map(r => r.code || r.reason || r.text).join(", ")}</td>
+      <td>
+        <button class="btn-sm success" onclick="approveCandidate(${c.id})">Approve</button>
+        <button class="btn-sm danger" onclick="rejectCandidate(${c.id})">Reject</button>
+      </td>
+    </tr>
+  `).join("");
+  updateSelectionUI();
+}
+
+function onRowSelectChange(id, checked) {
+  if (checked) {
+    selectedCandidateIds.add(id);
+  } else {
+    selectedCandidateIds.delete(id);
+  }
+  updateSelectionUI();
+}
+
+function toggleSelectAll(masterCheckbox) {
+  if (masterCheckbox.checked) {
+    allCurrentCandidates.forEach(c => selectedCandidateIds.add(c.id));
+  } else {
+    selectedCandidateIds.clear();
+  }
+  renderCandidatesTable();
+}
+
+function updateSelectionUI() {
+  const count = selectedCandidateIds.size;
+  const countEl = document.getElementById("selection-counter");
+  const btnApprove = document.getElementById("btn-approve-selected");
+  const btnReject = document.getElementById("btn-reject-selected");
+  const masterBox = document.getElementById("select-all-cands");
+
+  countEl.textContent = count ? `(${count} selected)` : "";
+  btnApprove.disabled = count === 0;
+  btnReject.disabled = count === 0;
+  if (masterBox && allCurrentCandidates.length > 0) {
+    masterBox.checked = count === allCurrentCandidates.length;
+    masterBox.indeterminate = count > 0 && count < allCurrentCandidates.length;
+  }
+}
+
+async function approveSelected() {
+  const ids = Array.from(selectedCandidateIds);
+  if (!ids.length) return;
+  showToast(`Approving ${ids.length} selected candidates…`);
+  try {
+    const res = await fetch(`/api/actions/bulk-approve?ids=${ids.join(",")}`, { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      showToast(`Successfully approved ${data.count} candidates!`);
+      selectedCandidateIds.clear();
+    } else {
+      showToast("Bulk approve error: " + (data.error || "failed"), true);
+    }
+  } catch (err) {
+    showToast("Error: " + err.message, true);
+  } finally {
+    refreshAll();
+  }
+}
+
+async function rejectSelected() {
+  const ids = Array.from(selectedCandidateIds);
+  if (!ids.length) return;
+  showToast(`Rejecting ${ids.length} selected candidates…`);
+  try {
+    const res = await fetch(`/api/actions/bulk-reject?ids=${ids.join(",")}`, { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      showToast(`Rejected ${data.count} candidates.`);
+      selectedCandidateIds.clear();
+    } else {
+      showToast("Bulk reject error: " + (data.error || "failed"), true);
+    }
+  } catch (err) {
+    showToast("Error: " + err.message, true);
+  } finally {
+    refreshAll();
+  }
+}
+
+async function approveAllPending() {
+  if (!confirm(`Are you sure you want to approve all ${allCurrentCandidates.length} pending candidates?`)) return;
+  showToast("Approving all pending candidates…");
+  try {
+    const res = await fetch("/api/actions/approve-all", { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      showToast(`Approved all ${data.count} candidates!`);
+      selectedCandidateIds.clear();
+    } else {
+      showToast("Failed to approve all: " + (data.error || "unknown"), true);
+    }
+  } catch (err) {
+    showToast("Error: " + err.message, true);
+  } finally {
+    refreshAll();
+  }
+}
+
+function onSearchInput(query) {
+  clearTimeout(searchDebounceTimer);
+  if (!query || query.trim().length < 2) {
+    closeSearch();
+    return;
+  }
+  searchDebounceTimer = setTimeout(() => { executeSearch(query.trim()); }, 200);
+}
+
+async function executeSearch(q) {
+  const panel = document.getElementById("search-results-panel");
+  const content = document.getElementById("search-results-content");
+  const title = document.getElementById("search-results-title");
+  panel.style.display = "block";
+  title.textContent = `Search Results for "${q}"`;
+  content.innerHTML = `<span style="color:var(--muted); font-size:12px;">Searching Spotify library and candidates…</span>`;
+
+  const data = await safeFetch(`/api/search?q=${encodeURIComponent(q)}`);
+  if (!data || data.error) {
+    content.innerHTML = `<span style="color:var(--bad);">Search error: ${data ? data.error : "network"}</span>`;
+    return;
+  }
+
+  let html = "";
+
+  // Matching Library Tracks
+  if (data.tracks && data.tracks.length) {
+    html += `<h3 style="font-size:12px; text-transform:uppercase; color:var(--accent); margin:10px 0 6px;">Songs & Library Tracks (${data.tracks.length})</h3>`;
+    html += `<table><thead><tr><th>Song Title</th><th>Artist</th><th>Album</th><th>Length</th><th>State</th></tr></thead><tbody>`;
+    html += data.tracks.map(t => `
+      <tr>
+        <td><b>${t.title}</b></td>
+        <td>${t.artist_name}</td>
+        <td>${t.album_title}</td>
+        <td>${msToMin(t.duration_ms)}</td>
+        <td>${t.validated ? '<span class="badge ok">✓ On Player / Synced</span>' : '<span class="badge sync">Spotify Indexed</span>'}</td>
+      </tr>
+    `).join("");
+    html += `</tbody></table>`;
+  }
+
+  // Matching Artists
+  if (data.artists && data.artists.length) {
+    html += `<h3 style="font-size:12px; text-transform:uppercase; color:var(--good); margin:16px 0 6px;">Artists (${data.artists.length})</h3>`;
+    html += `<table><thead><tr><th>Artist Name</th><th>Indexed Tracks</th></tr></thead><tbody>`;
+    html += data.artists.map(a => `
+      <tr>
+        <td><b>${a.name}</b></td>
+        <td>${a.tracks_count} tracks</td>
+      </tr>
+    `).join("");
+    html += `</tbody></table>`;
+  }
+
+  // Matching Discovery Candidates
+  if (data.candidates && data.candidates.length) {
+    html += `<h3 style="font-size:12px; text-transform:uppercase; color:var(--warn); margin:16px 0 6px;">Matching Candidates (${data.candidates.length})</h3>`;
+    html += `<table><thead><tr><th>#</th><th>Artist</th><th>Release</th><th>Score</th><th>Status</th><th>Action</th></tr></thead><tbody>`;
+    html += data.candidates.map(c => `
+      <tr>
+        <td>#${c.id}</td>
+        <td>${c.artist_name || "-"}</td>
+        <td><b>${c.entity_name}</b></td>
+        <td>${c.score ? c.score.toFixed(1) : "-"}</td>
+        <td><span class="badge ${c.status==='approved'?'ok':'warn'}">${c.status}</span></td>
+        <td>
+          ${c.status==='awaiting_approval' ? `
+            <button class="btn-sm success" onclick="approveCandidate(${c.id})">Approve</button>
+            <button class="btn-sm danger" onclick="rejectCandidate(${c.id})">Reject</button>
+          ` : `<span style="color:var(--muted); font-size:11px;">Already ${c.status}</span>`}
+        </td>
+      </tr>
+    `).join("");
+    html += `</tbody></table>`;
+  }
+
+  if (!data.tracks.length && !data.artists.length && !data.candidates.length) {
+    html = `<div class="empty-msg">No artists, songs, or candidates matched "${q}"</div>`;
+  }
+
+  content.innerHTML = html;
+}
+
+function closeSearch() {
+  document.getElementById("search-results-panel").style.display = "none";
+}
+
 async function triggerScan(btn) {
   btn.disabled = true;
   showToast("Scanning library directories for audio files…");
@@ -643,7 +1006,7 @@ async function triggerSync(btn, dryRun) {
     if (data.ok) {
       if (dryRun) {
         const p = data.plan;
-        showToast(`Sync Plan: ${p.add.length} to add, ${p.skip.length} unchanged, Fits: ${p.fits ? "YES" : "NO"} (${gb(p.planned_bytes)})`);
+        showToast(`Sync Plan: ${p.counts.add} to add, ${p.counts.skip} unchanged, Fits: ${p.fits ? "YES" : "NO"} (${gb(p.planned_bytes)})`);
       } else {
         const r = data.result;
         showToast(`Sync Complete! Added: ${r.added}, Verified: ${r.verified}, Skipped: ${r.skipped}`, false);
@@ -685,6 +1048,7 @@ async function approveCandidate(id) {
     const data = await res.json();
     if (data.ok) {
       showToast(`Candidate #${id} approved!`);
+      selectedCandidateIds.delete(id);
     } else {
       showToast("Could not approve: " + data.error, true);
     }
@@ -702,6 +1066,7 @@ async function rejectCandidate(id) {
     const data = await res.json();
     if (data.ok) {
       showToast(`Candidate #${id} rejected.`);
+      selectedCandidateIds.delete(id);
     } else {
       showToast("Could not reject: " + data.error, true);
     }
