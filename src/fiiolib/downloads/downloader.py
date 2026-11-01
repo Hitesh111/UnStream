@@ -147,7 +147,7 @@ def download_track(config: Config, db: Database, track_id: int) -> dict[str, Any
             "--audio-quality",
             "0",
             "--postprocessor-args",
-            "ffmpeg:-ar 44100 -ac 2",
+            "ffmpeg:-ar 44100 -ac 2 -af asetnsamples=n=4096:p=0 -sample_fmt s16",
             "--default-search",
             "ytsearch",
             "--max-downloads",
