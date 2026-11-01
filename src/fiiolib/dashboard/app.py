@@ -1196,7 +1196,7 @@ input[type="checkbox"] { cursor: pointer; }
   background: rgba(0, 0, 0, 0.75);
   backdrop-filter: blur(4px);
   z-index: 1000;
-  display: flex;
+  display: none;
   align-items: center;
   justify-content: center;
   padding: 20px;
@@ -1789,7 +1789,7 @@ input[type="checkbox"] { cursor: pointer; }
 </main>
 
 <!-- Playlist Detail Modal -->
-<div id="playlist-modal" class="modal-overlay" onclick="onModalOverlayClick(event)">
+<div id="playlist-modal" class="modal-overlay" style="display:none;" onclick="onModalOverlayClick(event)">
   <div class="modal-dialog">
     <div style="padding:16px 20px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; align-items:center;">
       <div>
