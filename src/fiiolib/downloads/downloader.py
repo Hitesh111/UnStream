@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -328,10 +329,101 @@ def download_playlist(
     }
 
 
+def clean_volume_junk(volume_path: Path) -> int:
+    """Purge macOS AppleDouble ._* resource forks and .DS_Store from target volume."""
+    cleaned = 0
+    if not volume_path.exists():
+        return 0
+    if sys.platform == "darwin" and shutil.which("dot_clean"):
+        try:
+            subprocess.run(["dot_clean", "-m", str(volume_path)], capture_output=True, check=False, timeout=20)
+        except Exception:
+            pass
+    for root, dirs, files in os.walk(volume_path):
+        for f in files:
+            if f.startswith("._") or f in (".DS_Store", "Thumbs.db"):
+                fp = os.path.join(root, f)
+                try:
+                    os.remove(fp)
+                    cleaned += 1
+                except Exception:
+                    pass
+    return cleaned
+
+
+def _write_m3u_bundle(
+    target_dir: Path,
+    name: str,
+    tracks: list[dict[str, Any]],
+    music_dir: Path,
+) -> Path | None:
+    """Write compliant CRLF UTF-8 .m3u and .m3u8 files with relative and root path variations."""
+    if not tracks:
+        return None
+    target_dir.mkdir(parents=True, exist_ok=True)
+    m3u_path = target_dir / f"{name}.m3u"
+    m3u8_path = target_dir / f"{name}.m3u8"
+
+    lines_rel: list[str] = ["#EXTM3U"]
+    lines_root: list[str] = ["#EXTM3U"]
+    matched = 0
+
+    for t in tracks:
+        file_path_str = t["path"]
+        if not file_path_str:
+            continue
+        fp = Path(file_path_str)
+        if not fp.exists():
+            continue
+        dur = t["duration_ms"] if ("duration_ms" in t.keys() and t["duration_ms"]) else 0
+        dur_sec = dur // 1000
+        extinf = f"#EXTINF:{dur_sec},{t['artist_name']} - {t['title']}"
+        lines_rel.append(extinf)
+        lines_root.append(extinf)
+
+        try:
+            rel_within_music = fp.resolve().relative_to(music_dir.resolve())
+            rel_posix = rel_within_music.as_posix()
+            lines_rel.append(f"../Music/{rel_posix}")
+            lines_root.append(f"Music/{rel_posix}")
+        except ValueError:
+            try:
+                rel = os.path.relpath(file_path_str, target_dir)
+                lines_rel.append(rel)
+                lines_root.append(file_path_str)
+            except ValueError:
+                lines_rel.append(file_path_str)
+                lines_root.append(file_path_str)
+        matched += 1
+
+    if matched == 0:
+        return None
+
+    # DOS CRLF is required by embedded FAT32 players (Ingenic/Actions/Rockchip)
+    content_rel = "\r\n".join(lines_rel) + "\r\n"
+    content_root = "\r\n".join(lines_root) + "\r\n"
+
+    # Write both .m3u and .m3u8 in target_dir
+    m3u_path.write_bytes(content_rel.encode("utf-8"))
+    m3u8_path.write_bytes(content_rel.encode("utf-8"))
+
+    # Also place root copies if target_dir is a subfolder on a volume/drive
+    parent = target_dir.parent
+    if parent and parent != target_dir and parent.exists():
+        if target_dir.name.lower() in ("playlists", "playlist"):
+            try:
+                (parent / f"{name}.m3u").write_bytes(content_root.encode("utf-8"))
+                (parent / f"{name}.m3u8").write_bytes(content_root.encode("utf-8"))
+            except Exception:
+                pass
+
+    return m3u_path
+
+
 def export_playlist_m3u(
     config: Config, db: Database, playlist_id: int, target_dir: Path | None = None
 ) -> Path | None:
-    """Generate an Echo Mini compliant UTF-8 .m3u8 playlist file."""
+    """Generate compliant UTF-8 .m3u and .m3u8 playlist files for Echo Mini / FiiO players."""
     pl_row = db.one("SELECT id, name FROM playlists WHERE id = ?", (playlist_id,))
     if not pl_row:
         return None
@@ -339,8 +431,6 @@ def export_playlist_m3u(
     name = sanitize_component(raw_name)
     if not target_dir:
         target_dir = config.root / "playlists"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    m3u_path = target_dir / f"{name}.m3u8"
 
     tracks = db.query(
         "SELECT t.title, a.name AS artist_name, t.duration_ms, f.path "
@@ -352,45 +442,15 @@ def export_playlist_m3u(
         "ORDER BY pt.position ASC",
         (playlist_id,),
     )
-    lines = ["#EXTM3U", f"#PLAYLIST:{raw_name}"]
-    matched = 0
-    music_dir = config.music_dir.resolve()
-    for t in tracks:
-        file_path_str = t["path"]
-        if not file_path_str:
-            continue
-        fp = Path(file_path_str)
-        if not fp.exists():
-            continue
-        dur_sec = (t["duration_ms"] or 0) // 1000
-        lines.append(f"#EXTINF:{dur_sec},{t['artist_name']} - {t['title']}")
-        try:
-            rel_within_music = fp.resolve().relative_to(music_dir)
-            lines.append(f"../Music/{rel_within_music.as_posix()}")
-        except ValueError:
-            try:
-                rel = os.path.relpath(file_path_str, target_dir)
-                lines.append(rel)
-            except ValueError:
-                lines.append(file_path_str)
-        matched += 1
-
-    if matched == 0:
-        # Don't create empty playlist files
-        return None
-
-    m3u_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return m3u_path
+    return _write_m3u_bundle(target_dir, name, tracks, config.music_dir)
 
 
 def export_saved_tracks_m3u(
     config: Config, db: Database, target_dir: Path | None = None
 ) -> Path | None:
-    """Generate an Echo Mini compliant UTF-8 .m3u8 playlist file for Spotify Liked Songs."""
+    """Generate compliant UTF-8 .m3u and .m3u8 playlist files for Liked Songs."""
     if not target_dir:
         target_dir = config.root / "playlists"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    m3u_path = target_dir / "Liked Songs.m3u8"
 
     tracks = db.query(
         "SELECT t.title, a.name AS artist_name, t.duration_ms, f.path "
@@ -400,48 +460,163 @@ def export_saved_tracks_m3u(
         "LEFT JOIN files f ON f.track_id = t.id AND f.validated = 1 "
         "ORDER BY st.added_at DESC",
     )
-    lines = ["#EXTM3U", "#PLAYLIST:Liked Songs"]
-    matched = 0
-    music_dir = config.music_dir.resolve()
-    for t in tracks:
-        file_path_str = t["path"]
-        if not file_path_str:
-            continue
-        fp = Path(file_path_str)
-        if not fp.exists():
-            continue
-        dur_sec = (t["duration_ms"] or 0) // 1000
-        lines.append(f"#EXTINF:{dur_sec},{t['artist_name']} - {t['title']}")
-        try:
-            rel_within_music = fp.resolve().relative_to(music_dir)
-            lines.append(f"../Music/{rel_within_music.as_posix()}")
-        except ValueError:
-            try:
-                rel = os.path.relpath(file_path_str, target_dir)
-                lines.append(rel)
-            except ValueError:
-                lines.append(file_path_str)
-        matched += 1
-
-    if matched == 0:
-        return None
-
-    m3u_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return m3u_path
+    return _write_m3u_bundle(target_dir, "Liked Songs", tracks, config.music_dir)
 
 
 def export_all_playlists(config: Config, db: Database, target_dir: Path | None = None) -> list[str]:
-    """Export all playlists (including Liked Songs) that contain at least one downloaded audio track."""
+    """Export all playlists (including Liked Songs) to local library and active card target."""
     rows = db.query("SELECT DISTINCT playlist_id FROM playlist_tracks")
+    targets: list[Path] = []
+
+    if target_dir:
+        targets.append(target_dir)
+    else:
+        # Default target: local library playlists directory
+        local_pl = config.root / "playlists"
+        targets.append(local_pl)
+        # Check if an active microSD card or custom sync folder is configured/connected
+        from fiiolib.device.detect import DeviceLocator
+        locator = DeviceLocator(config)
+        dev = locator.current()
+        if dev and dev.mount_point:
+            mp = Path(dev.mount_point)
+            if mp.exists():
+                card_pl = mp / "Playlists"
+                targets.append(card_pl)
+
     exported = []
-    for r in rows:
-        path = export_playlist_m3u(config, db, int(r["playlist_id"]), target_dir=target_dir)
-        if path:
-            exported.append(str(path))
-    saved_path = export_saved_tracks_m3u(config, db, target_dir=target_dir)
-    if saved_path:
-        exported.append(str(saved_path))
+    for tgt in targets:
+        for r in rows:
+            path = export_playlist_m3u(config, db, int(r["playlist_id"]), target_dir=tgt)
+            if path and str(path) not in exported:
+                exported.append(str(path))
+        saved_path = export_saved_tracks_m3u(config, db, target_dir=tgt)
+        if saved_path and str(saved_path) not in exported:
+            exported.append(str(saved_path))
+        # Purge any AppleDouble resource forks on destination
+        clean_volume_junk(tgt)
+
     return exported
+
+
+def export_folder_playlists(
+    config: Config,
+    db: Database,
+    target_dir: Path | None = None,
+    playlist_ids: list[int] | None = None,
+) -> dict[str, Any]:
+    """Export playlists as physical track folders (EchoList mode) for guaranteed playback on any DAP firmware."""
+    if target_dir is None:
+        from fiiolib.device.detect import DeviceLocator
+        locator = DeviceLocator(config)
+        dev = locator.current()
+        if dev and dev.mount_point:
+            mp = Path(dev.mount_point)
+            if mp.exists():
+                target_dir = mp / "Playlists"
+            else:
+                target_dir = config.root / "playlists"
+        else:
+            target_dir = config.root / "playlists"
+
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    if playlist_ids:
+        pl_rows = db.query(
+            "SELECT id, name FROM playlists WHERE id IN ({})".format(",".join("?" * len(playlist_ids))),
+            tuple(playlist_ids),
+        )
+    else:
+        pl_rows = db.query(
+            "SELECT DISTINCT p.id, p.name FROM playlists p "
+            "JOIN playlist_tracks pt ON pt.playlist_id = p.id "
+            "ORDER BY p.name ASC"
+        )
+
+    results = []
+    total_copied = 0
+    total_skipped = 0
+
+    for pl in pl_rows:
+        pl_id = int(pl["id"])
+        pl_name = sanitize_component(pl["name"])
+        folder = target_dir / pl_name
+        folder.mkdir(parents=True, exist_ok=True)
+
+        tracks = db.query(
+            "SELECT t.title, a.name AS artist_name, pt.position, f.path "
+            "FROM playlist_tracks pt "
+            "JOIN tracks t ON t.id = pt.track_id "
+            "JOIN artists a ON a.id = t.artist_id "
+            "LEFT JOIN files f ON f.track_id = t.id AND f.validated = 1 "
+            "WHERE pt.playlist_id = ? "
+            "ORDER BY pt.position ASC",
+            (pl_id,),
+        )
+        copied = 0
+        skipped = 0
+        for idx, t in enumerate(tracks, 1):
+            src_str = t["path"]
+            if not src_str:
+                continue
+            src = Path(src_str)
+            if not src.exists():
+                continue
+            ext = src.suffix or ".flac"
+            safe_title = sanitize_component(t["title"])
+            safe_artist = sanitize_component(t["artist_name"])
+            dest = folder / f"{idx:02d} - {safe_artist} - {safe_title}{ext}"
+            if dest.exists() and dest.stat().st_size == src.stat().st_size:
+                skipped += 1
+            else:
+                shutil.copy2(src, dest)
+                copied += 1
+        total_copied += copied
+        total_skipped += skipped
+        results.append({"name": pl["name"], "folder": str(folder), "copied": copied, "skipped": skipped, "total": len(tracks)})
+
+    # Also handle Liked Songs
+    liked_tracks = db.query(
+        "SELECT t.title, a.name AS artist_name, f.path "
+        "FROM spotify_saved_tracks st "
+        "JOIN tracks t ON t.id = st.track_id "
+        "JOIN artists a ON a.id = t.artist_id "
+        "LEFT JOIN files f ON f.track_id = t.id AND f.validated = 1 "
+        "ORDER BY st.added_at DESC",
+    )
+    if liked_tracks:
+        liked_folder = target_dir / "Liked Songs"
+        liked_folder.mkdir(parents=True, exist_ok=True)
+        c_liked = 0
+        s_liked = 0
+        for idx, t in enumerate(liked_tracks, 1):
+            src_str = t["path"]
+            if not src_str:
+                continue
+            src = Path(src_str)
+            if not src.exists():
+                continue
+            ext = src.suffix or ".flac"
+            safe_title = sanitize_component(t["title"])
+            safe_artist = sanitize_component(t["artist_name"])
+            dest = liked_folder / f"{idx:02d} - {safe_artist} - {safe_title}{ext}"
+            if dest.exists() and dest.stat().st_size == src.stat().st_size:
+                s_liked += 1
+            else:
+                shutil.copy2(src, dest)
+                c_liked += 1
+        total_copied += c_liked
+        total_skipped += s_liked
+        results.append({"name": "Liked Songs", "folder": str(liked_folder), "copied": c_liked, "skipped": s_liked, "total": len(liked_tracks)})
+
+    clean_volume_junk(target_dir)
+
+    return {
+        "ok": True,
+        "total_copied": total_copied,
+        "total_skipped": total_skipped,
+        "playlists": results,
+    }
 
 
 def download_playlists_batch(

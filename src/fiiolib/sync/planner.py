@@ -364,40 +364,27 @@ class SyncPlanner:
 
         if not dry_run and not result["errors"]:
             result["albums_synced"] = self._mark_albums_synced(plan)
-            # Sync M3U8 playlists to microSD card
+            # Sync compliant M3U / M3U8 playlists to microSD card
             try:
-                from fiiolib.downloads.downloader import export_all_playlists
+                from fiiolib.downloads.downloader import clean_volume_junk, export_all_playlists
                 card_playlists = plan.device.mount_point / "Playlists"
                 exported = export_all_playlists(self.config, self.db, target_dir=card_playlists)
                 if exported:
                     activity.log(
                         level="info",
                         category="playlist",
-                        message=f"Exported {len(exported)} M3U8 playlists to card Playlists/ directory.",
+                        message=f"Exported {len(exported)} M3U playlists to card (in Playlists/ and card root).",
+                    )
+                # Purge any AppleDouble ._* resource forks and .DS_Store from the entire card
+                cleaned = clean_volume_junk(plan.device.mount_point)
+                if cleaned > 0:
+                    activity.log(
+                        level="info",
+                        category="sync",
+                        message=f"Purged {cleaned} hidden macOS AppleDouble (._*) files from card.",
                     )
             except Exception as exc:
                 logger.warning("Could not export card playlists: %s", exc)
-
-            # macOS automatically creates AppleDouble ._* files on FAT/exFAT volumes,
-            # which confuse the Echo Mini display. Clean them automatically after sync.
-            if sys.platform == "darwin" and shutil.which("dot_clean"):
-                activity.log(
-                    level="info",
-                    category="sync",
-                    message="Running macOS dot_clean to merge AppleDouble resource fork files…",
-                )
-                try:
-                    for folder in ("Music", "Playlists"):
-                        target_path = plan.device.mount_point / folder
-                        if target_path.exists():
-                            subprocess.run(
-                                ["dot_clean", "-m", str(target_path)],
-                                capture_output=True,
-                                check=False,
-                                timeout=30,
-                            )
-                except Exception:
-                    pass
 
         if not dry_run:
             activity.finish_operation(

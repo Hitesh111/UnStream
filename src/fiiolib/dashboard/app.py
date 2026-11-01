@@ -462,6 +462,27 @@ def create_app(config: Config, db: Database) -> FastAPI:
         exported = export_all_playlists(config, db)
         return {"ok": True, "exported": len(exported), "playlists": exported}
 
+    @app.post("/api/actions/export-folder-playlists")
+    def action_export_folder_playlists(playlist_ids: str | None = Query(default=None)) -> dict[str, Any]:
+        from fiiolib.downloads.downloader import export_folder_playlists
+        pids = [int(x.strip()) for x in playlist_ids.split(",") if x.strip().isdigit()] if playlist_ids else None
+        res = export_folder_playlists(config, db, playlist_ids=pids)
+        return res
+
+    @app.post("/api/actions/clean-card-junk")
+    def action_clean_card_junk() -> dict[str, Any]:
+        from fiiolib.device.detect import DeviceLocator
+        from fiiolib.downloads.downloader import clean_volume_junk
+        locator = DeviceLocator(config)
+        dev = locator.current()
+        if not dev or not dev.mount_point:
+            return {"ok": False, "error": "No target card or volume connected."}
+        mp = Path(dev.mount_point)
+        if not mp.exists():
+            return {"ok": False, "error": f"Path does not exist: {dev.mount_point}"}
+        cleaned = clean_volume_junk(mp)
+        return {"ok": True, "cleaned": cleaned, "path": str(mp)}
+
     @app.post("/api/actions/download-saved")
     def action_download_saved(limit: int = Query(default=0)) -> dict[str, Any]:
         from fiiolib.downloads.downloader import download_saved_tracks
@@ -1580,7 +1601,9 @@ input[type="checkbox"] { cursor: pointer; }
         <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
           <button class="btn-sm primary" id="btn-dl-selected-playlists" onclick="downloadSelectedPlaylists(this)" disabled>⬇ Download Selected</button>
           <button class="btn-sm" id="btn-dl-all-playlists" onclick="downloadAllPlaylists(this)">⬇ Download All Playlists</button>
-          <button class="btn-sm" onclick="exportAllM3uPlaylists(this)">📑 Export M3U8s</button>
+          <button class="btn-sm" onclick="exportAllM3uPlaylists(this)" title="Generate compliant .m3u & .m3u8 playlists on microSD card and library">📑 Export M3U to Card</button>
+          <button class="btn-sm" onclick="exportFolderPlaylists(this)" title="Physical folder playlists (EchoList mode) - 100% compatible with all firmware versions">📁 Folder Playlists</button>
+          <button class="btn-sm" onclick="cleanCardJunk(this)" title="Purge hidden macOS AppleDouble ._* and .DS_Store files">🧹 Clean Card Junk</button>
           <label style="font-size:11px; color:var(--muted); cursor:pointer; display:flex; align-items:center; gap:5px; margin-left:6px;">
             <input type="checkbox" id="chk-only-indexed" onchange="loadPlaylists()" checked> Only with tracks
           </label>
@@ -1588,6 +1611,10 @@ input[type="checkbox"] { cursor: pointer; }
             <input type="checkbox" id="chk-only-downloaded-pl" onchange="loadPlaylists()"> Only downloaded
           </label>
         </div>
+      </div>
+      <div style="margin-bottom: 12px; padding: 8px 12px; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; font-size: 11px; color: var(--muted); line-height: 1.5;">
+        <strong style="color:var(--text);">FiiO Playlists Guide:</strong>
+        M3U playlists are exported to card root and <code style="color:var(--accent); font-size:10px;">Playlists/</code> as <code style="color:var(--accent); font-size:10px;">.m3u</code> (CRLF). On Echo Mini, run <strong>Settings &rarr; Update Media Lib</strong> to scan them (Firmware V4.0.0+). For <strong>all</strong> firmwares, click <strong>📁 Folder Playlists</strong> and play directly from the player's <strong>Folder</strong> menu.
       </div>
       <div style="max-height: 480px; overflow-y: auto; border: 1px solid var(--line); border-radius: 6px;">
         <table id="playlists-table">
@@ -2188,12 +2215,12 @@ async function exportAllM3uPlaylists(btn) {
     btn.disabled = true;
     btn.textContent = "⏳ Exporting…";
   }
-  showToast("Exporting M3U8 playlists for FiiO player…");
+  showToast("Exporting M3U playlists to microSD card & library…");
   try {
     const res = await fetch("/api/actions/export-playlists", { method: "POST" });
     const data = await res.json();
     if (data.ok) {
-      showToast(`M3U8 playlists updated: ${data.exported} playlists generated (${data.total_tracks} tracks).`);
+      showToast(`✓ Playlists updated: ${data.exported} M3U playlists generated across card and library.`);
     } else {
       showToast("Export error: " + (data.error || "failed"), true);
     }
@@ -2202,7 +2229,54 @@ async function exportAllM3uPlaylists(btn) {
   } finally {
     if (btn) {
       btn.disabled = false;
-      btn.textContent = "📑 Export M3U8s";
+      btn.textContent = "📑 Export M3U to Card";
+    }
+  }
+}
+
+async function exportFolderPlaylists(btn) {
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "⏳ Copying…";
+  }
+  showToast("Exporting physical folder playlists (EchoList mode) to card…");
+  try {
+    const res = await fetch("/api/actions/export-folder-playlists", { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      showToast(`✓ Folder playlists ready: ${data.total_copied} tracks copied, ${data.total_skipped} existing across ${data.playlists.length} playlists.`);
+    } else {
+      showToast("Export error: " + (data.error || "failed"), true);
+    }
+  } catch (err) {
+    showToast("Error: " + err.message, true);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "📁 Folder Playlists";
+    }
+  }
+}
+
+async function cleanCardJunk(btn) {
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "⏳ Cleaning…";
+  }
+  try {
+    const res = await fetch("/api/actions/clean-card-junk", { method: "POST" });
+    const data = await res.json();
+    if (data.ok) {
+      showToast(`✓ Cleaned ${data.cleaned} hidden macOS junk files from ${data.path}`);
+    } else {
+      showToast(data.error || "Failed to clean card", true);
+    }
+  } catch (err) {
+    showToast("Error: " + err.message, true);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = "🧹 Clean Card Junk";
     }
   }
 }
