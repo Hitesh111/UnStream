@@ -116,6 +116,9 @@ class DeviceLocator:
         self.config = config
 
     def candidates(self) -> list[VolumeInfo]:
+        import shutil
+        from pathlib import Path
+
         volumes = list_external_volumes()
         whitelist = {value.lower() for value in self.config.device.filesystem_whitelist}
         results: list[VolumeInfo] = []
@@ -138,17 +141,81 @@ class DeviceLocator:
             volume.reasons = reasons
             volume.is_echo_candidate = volume.filesystem in whitelist and volume.capacity_bytes >= 30 * 1024**3
             results.append(volume)
+
+        # Include custom configured mount_point if specified
+        custom_mp = getattr(self.config.device, "mount_point", None)
+        if custom_mp:
+            p = Path(custom_mp).expanduser().resolve()
+            if p.is_dir() and not any(v.mount_point and Path(v.mount_point).resolve() == p for v in results):
+                usage = shutil.disk_usage(p)
+                results.append(
+                    VolumeInfo(
+                        identifier=str(p),
+                        volume_name=p.name or "Selected Target",
+                        mount_point=str(p),
+                        filesystem="custom",
+                        capacity_bytes=usage.total,
+                        device=str(p),
+                        removable=True,
+                        internal=False,
+                        is_echo_candidate=True,
+                        reasons=["Configured sync target folder"],
+                    )
+                )
+
         return results
 
     def current(self, identifier: str | None = None) -> VolumeInfo:
+        import shutil
+        from pathlib import Path
+
         candidates = self.candidates()
         if identifier:
             for volume in candidates:
                 if identifier in {volume.identifier, volume.volume_uuid, volume.device, volume.volume_name}:
                     return volume
+            # Handle if identifier is a directory path
+            p = Path(identifier).expanduser().resolve()
+            if p.is_dir():
+                usage = shutil.disk_usage(p)
+                return VolumeInfo(
+                    identifier=str(p),
+                    volume_name=p.name or "Selected Target",
+                    mount_point=str(p),
+                    filesystem="custom",
+                    capacity_bytes=usage.total,
+                    device=str(p),
+                    removable=True,
+                    internal=False,
+                    is_echo_candidate=True,
+                    reasons=["Selected folder / mount point"],
+                )
             raise DeviceError(f"No mounted volume matches {identifier!r}")
+
+        # Check configured mount point if no identifier passed
+        custom_mp = getattr(self.config.device, "mount_point", None)
+        if custom_mp:
+            p = Path(custom_mp).expanduser().resolve()
+            if p.is_dir():
+                for v in candidates:
+                    if v.mount_point and Path(v.mount_point).resolve() == p:
+                        return v
+                usage = shutil.disk_usage(p)
+                return VolumeInfo(
+                    identifier=str(p),
+                    volume_name=p.name or "Selected Target",
+                    mount_point=str(p),
+                    filesystem="custom",
+                    capacity_bytes=usage.total,
+                    device=str(p),
+                    removable=True,
+                    internal=False,
+                    is_echo_candidate=True,
+                    reasons=["Configured sync target folder"],
+                )
+
         if not candidates:
-            raise DeviceError("No external SD card volumes are mounted")
+            raise DeviceError("No external SD card volumes or sync targets are configured")
         if len(candidates) == 1:
             return candidates[0]
         echo = [v for v in candidates if v.is_echo_candidate]

@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Query, Request
@@ -616,6 +619,127 @@ def create_app(config: Config, db: Database) -> FastAPI:
             export_all_playlists(config, db)
         return res
 
+    @app.get("/api/system/folders")
+    def system_folders(path: str = Query(default="")) -> dict[str, Any]:
+        """List directories and storage details for interactive folder selection."""
+        if not path or not path.strip():
+            target_path = Path.home()
+        else:
+            target_path = Path(path).expanduser().resolve()
+
+        if not target_path.exists() or not target_path.is_dir():
+            target_path = Path.home()
+
+        parent = str(target_path.parent) if target_path.parent != target_path else None
+
+        subdirs: list[dict[str, Any]] = []
+        try:
+            for item in sorted(target_path.iterdir(), key=lambda p: p.name.lower()):
+                if item.is_dir() and not item.name.startswith("."):
+                    subdirs.append({"name": item.name, "path": str(item)})
+        except (PermissionError, OSError):
+            pass
+
+        quick_paths = [
+            {"label": "Home (~)", "path": str(Path.home())},
+            {"label": "Music", "path": str(Path.home() / "Music")},
+            {"label": "Downloads", "path": str(Path.home() / "Downloads")},
+            {"label": "Library", "path": str(config.root)},
+        ]
+        if Path("/Volumes").exists():
+            quick_paths.append({"label": "Volumes (/Volumes)", "path": "/Volumes"})
+            try:
+                for v in sorted(Path("/Volumes").iterdir()):
+                    if v.is_dir() and not v.name.startswith("."):
+                        quick_paths.append({"label": f"Card: {v.name}", "path": str(v)})
+            except (PermissionError, OSError):
+                pass
+
+        audio_count = 0
+        try:
+            for it in target_path.iterdir():
+                if it.is_file() and it.suffix.lower() in {".flac", ".mp3", ".m4a", ".wav", ".ogg", ".ape", ".dsf", ".dff", ".wma"}:
+                    audio_count += 1
+        except (PermissionError, OSError):
+            pass
+
+        try:
+            usage = shutil.disk_usage(target_path)
+            free_gb = round(usage.free / (1024**3), 2)
+            total_gb = round(usage.total / (1024**3), 2)
+        except OSError:
+            free_gb = 0.0
+            total_gb = 0.0
+
+        is_writable = os.access(str(target_path), os.W_OK)
+
+        return {
+            "current_path": str(target_path),
+            "parent_path": parent,
+            "subdirectories": subdirs[:120],
+            "quick_paths": quick_paths,
+            "audio_count": audio_count,
+            "free_gb": free_gb,
+            "total_gb": total_gb,
+            "is_writable": is_writable,
+        }
+
+    @app.post("/api/settings/target-device")
+    def set_target_device(mount_point: str = Query(...), confirm: bool = Query(default=True)) -> dict[str, Any]:
+        """Set a custom sync target folder or SD card mount point."""
+        from fiiolib.activity import activity
+        path = Path(mount_point).expanduser().resolve()
+        if not path.is_dir():
+            return {"ok": False, "error": f"Path '{path}' is not an existing directory"}
+
+        config.device.mount_point = str(path)
+        try:
+            planner = SyncPlanner(config, db)
+            vol = DeviceLocator(config).current(str(path))
+            device_id = planner.confirm(vol) if confirm else planner.register(vol)
+            activity.log(
+                level="success",
+                category="device",
+                message=f"✓ Target sync folder set to: {path} ({vol.capacity_gb} GB)",
+            )
+            return {"ok": True, "mount_point": str(path), "volume_name": vol.volume_name, "device_id": device_id}
+        except Exception as exc:
+            logger.exception("Failed to set target device")
+            return {"ok": False, "error": str(exc)}
+
+    @app.post("/api/settings/library-root")
+    def set_library_root(path: str = Query(...)) -> dict[str, Any]:
+        """Update the active library storage directory."""
+        from fiiolib.activity import activity
+        new_path = Path(path).expanduser().resolve()
+        try:
+            new_path.mkdir(parents=True, exist_ok=True)
+            config.app.library_root = new_path
+            config.ensure_directories()
+            activity.log(
+                level="success",
+                category="system",
+                message=f"✓ Library root directory updated to: {new_path}",
+            )
+            return {"ok": True, "library_root": str(config.root)}
+        except Exception as exc:
+            logger.exception("Failed to update library root")
+            return {"ok": False, "error": str(exc)}
+
+    @app.get("/api/folder/scan")
+    def api_scan_folder(path: str = Query(...)) -> dict[str, Any]:
+        """Preview audio tracks in a folder before importing."""
+        from fiiolib.library.importer import scan_folder
+        summary = scan_folder(path)
+        return {"ok": True, "summary": summary.as_dict()}
+
+    @app.post("/api/actions/import-folder")
+    def api_import_folder(folder_path: str = Query(...), copy_files: bool = Query(default=True)) -> dict[str, Any]:
+        """Scan and import audio files from a local directory into library."""
+        from fiiolib.library.importer import FolderImporter
+        importer = FolderImporter(config, db)
+        return importer.import_folder(folder_path, copy_files=copy_files)
+
     @app.get("/api/activity")
     def get_activity_logs(since_id: int = Query(default=0)) -> dict[str, Any]:
         from fiiolib.activity import activity
@@ -664,6 +788,11 @@ def _status(config: Config, db: Database) -> dict[str, Any]:
     spotify["profile_artists"] = len((db.get_preference(PROFILE_KEY) or {}).get("artists") or [])
     capabilities["spotify"] = spotify
     capabilities["library"] = library_stats(db)
+    capabilities["storage"] = {
+        "library_root": str(config.root),
+        "target_mount_point": getattr(config.device, "mount_point", None),
+        "device_music_subdir": config.device.music_subdir,
+    }
     capabilities["counts"] = {
         "candidates": int(db.scalar("SELECT COUNT(*) FROM discovery_candidates") or 0),
         "awaiting_approval": int(
@@ -1038,6 +1167,178 @@ input[type="checkbox"] { cursor: pointer; }
   gap: 12px;
   font-size: 12px;
 }
+
+/* Storage & Folder Modal */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.75);
+  backdrop-filter: blur(4px);
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+.modal-box {
+  background: #0d131d;
+  border: 1px solid var(--line-light);
+  border-radius: 8px;
+  width: 100%;
+  max-width: 680px;
+  max-height: 88vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 20px 40px rgba(0,0,0,0.6);
+  overflow: hidden;
+}
+.modal-header {
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: #111722;
+}
+.modal-tabs {
+  display: flex;
+  border-bottom: 1px solid var(--line);
+  background: #090d13;
+  padding: 0 14px;
+  gap: 6px;
+}
+.modal-tab-btn {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  padding: 10px 14px;
+  color: var(--muted);
+  font-size: 12.5px;
+  font-weight: 500;
+}
+.modal-tab-btn:hover { color: var(--fg); background: transparent; }
+.modal-tab-btn.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+.modal-body {
+  padding: 16px 18px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.modal-footer {
+  padding: 12px 18px;
+  border-top: 1px solid var(--line);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: #111722;
+}
+.folder-desc { font-size: 12px; color: var(--muted); margin-bottom: 10px; }
+.folder-current-box {
+  background: #141c2b;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+}
+.folder-label { font-size: 11px; text-transform: uppercase; color: var(--muted); letter-spacing: 0.04em; }
+.folder-val { font-size: 13px; font-weight: 600; color: #fff; font-family: ui-monospace, monospace; word-break: break-all; margin-top: 2px; }
+.folder-section-title { font-size: 12px; font-weight: 600; color: var(--fg); margin-bottom: 6px; }
+.detected-volumes-list { display: flex; flex-direction: column; gap: 6px; }
+.volume-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  background: #161e2c;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+.volume-item:hover { border-color: var(--accent); background: #1c2638; }
+.volume-item.active { border-color: var(--accent); background: rgba(56, 189, 248, 0.12); }
+.folder-picker-bar { display: flex; gap: 8px; }
+.folder-picker-bar input {
+  flex: 1;
+  background: #141c2b;
+  border: 1px solid var(--line-light);
+  border-radius: 6px;
+  padding: 6px 10px;
+  color: #fff;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  outline: none;
+}
+.folder-browser-box {
+  background: #0a0e14;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+.browser-header { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+.quick-paths-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.quick-chip {
+  font-size: 11px;
+  background: #1e293b;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 3px 8px;
+  color: var(--muted);
+  cursor: pointer;
+}
+.quick-chip:hover { color: var(--accent); border-color: var(--accent); background: #243147; }
+.browser-current-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 8px;
+}
+.browser-path-display {
+  flex: 1;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  color: #fff;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.subfolders-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 6px;
+  max-height: 140px;
+  overflow-y: auto;
+}
+.folder-chip {
+  padding: 4px 8px;
+  background: #141c2b;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-size: 11.5px;
+  color: var(--fg);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.folder-chip:hover { border-color: var(--accent); background: #1c273c; color: #fff; }
+.import-preview-card {
+  background: #141c2b;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px 12px;
+}
 </style>
 </head>
 <body>
@@ -1048,6 +1349,7 @@ input[type="checkbox"] { cursor: pointer; }
     <span id="stamp" style="font-size: 11px;">connecting…</span>
   </div>
   <div class="header-actions">
+    <button onclick="openStorageModal('sync')">📁 Storage & Folders</button>
     <button onclick="triggerScan(this)">🔍 Scan Library</button>
     <button onclick="triggerSync(this, true)">📋 Preview Sync</button>
     <button class="primary" onclick="triggerSync(this, false)">⚡ Sync Card Now</button>
@@ -1075,10 +1377,109 @@ input[type="checkbox"] { cursor: pointer; }
 
 <div id="toast"></div>
 
+<!-- Storage & Folders Modal -->
+<div id="modal-storage" class="modal-overlay" style="display:none;" onclick="if(event.target===this)closeStorageModal()">
+  <div class="modal-box">
+    <div class="modal-header">
+      <div style="display:flex; align-items:center; gap:8px;">
+        <span style="font-size:16px;">📁</span>
+        <h3 style="margin:0; font-size:15px; font-weight:600;">Storage & Folder Manager</h3>
+      </div>
+      <button class="btn-sm" onclick="closeStorageModal()">✕</button>
+    </div>
+
+    <!-- Modal Tabs -->
+    <div class="modal-tabs">
+      <button class="modal-tab-btn active" id="modal-tab-sync" onclick="switchStorageTab('sync')">Target Sync Folder</button>
+      <button class="modal-tab-btn" id="modal-tab-library" onclick="switchStorageTab('library')">Library Storage</button>
+      <button class="modal-tab-btn" id="modal-tab-import" onclick="switchStorageTab('import')">Import from Folder</button>
+    </div>
+
+    <div class="modal-body">
+      <!-- Tab 1: Target Sync Folder -->
+      <div id="storage-view-sync" class="storage-tab-view">
+        <div class="folder-desc">Choose which SD card, USB drive, or folder to sync your music into for playback.</div>
+        <div class="folder-current-box">
+          <div class="folder-label">Current Sync Target:</div>
+          <div class="folder-val" id="sync-current-val">Loading…</div>
+        </div>
+
+        <div class="folder-section-title">Detected Drives & Volumes</div>
+        <div id="sync-detected-volumes" class="detected-volumes-list">
+          <div style="color:var(--muted); font-size:12px;">Scanning detected volumes…</div>
+        </div>
+
+        <div class="folder-section-title" style="margin-top:14px;">Or Set Custom Sync Destination</div>
+        <div class="folder-picker-bar">
+          <input type="text" id="sync-custom-input" placeholder="/Volumes/MyCard or custom path" spellcheck="false">
+          <button class="primary" onclick="applyCustomSyncFolder()">Set as Sync Folder</button>
+        </div>
+      </div>
+
+      <!-- Tab 2: Library Storage Root -->
+      <div id="storage-view-library" class="storage-tab-view" style="display:none;">
+        <div class="folder-desc">Location where UnStream stores downloaded FLAC files, organized folders, and database.</div>
+        <div class="folder-current-box">
+          <div class="folder-label">Current Library Directory:</div>
+          <div class="folder-val" id="lib-current-val">Loading…</div>
+        </div>
+
+        <div class="folder-section-title">Change Library Location</div>
+        <div class="folder-picker-bar">
+          <input type="text" id="lib-custom-input" placeholder="/Users/username/Music or custom path" spellcheck="false">
+          <button class="primary" onclick="applyCustomLibraryFolder()">Set Library Folder</button>
+        </div>
+      </div>
+
+      <!-- Tab 3: Import from Folder -->
+      <div id="storage-view-import" class="storage-tab-view" style="display:none;">
+        <div class="folder-desc">Scan any local folder with existing music (FLAC, MP3, etc.) to validate, tag, and import into your library.</div>
+        
+        <div class="folder-picker-bar">
+          <input type="text" id="import-folder-input" placeholder="Select or type folder path (e.g. ~/Music)" spellcheck="false">
+          <button class="btn-sm" onclick="scanSelectedImportFolder()">🔍 Preview Audio</button>
+          <button class="primary" id="btn-run-import" onclick="executeFolderImport()">📥 Import into Library</button>
+        </div>
+
+        <!-- Scan Preview Card -->
+        <div id="import-preview-box" style="display:none;" class="import-preview-card">
+          <div id="import-preview-stats" style="font-weight:600; font-size:12.5px; margin-bottom:6px;"></div>
+          <div id="import-preview-samples" style="font-size:11.5px; color:var(--muted); max-height:120px; overflow-y:auto;"></div>
+        </div>
+      </div>
+
+      <!-- Interactive Folder Browser / Subfolder Explorer -->
+      <div class="folder-browser-box">
+        <div class="browser-header">
+          <div style="font-size:11.5px; font-weight:600; color:var(--muted);">QUICK LOCATIONS:</div>
+          <div id="quick-paths-list" class="quick-paths-row"></div>
+        </div>
+        <div class="browser-current-row">
+          <button class="btn-sm" id="btn-folder-up" onclick="navigateFolderUp()" title="Go up to parent directory">⬆ Up</button>
+          <span class="browser-path-display" id="browser-current-path">~</span>
+          <button class="btn-sm" onclick="selectCurrentBrowserFolder()">Use This Folder</button>
+        </div>
+        <div class="subfolders-list" id="subfolders-list"></div>
+      </div>
+    </div>
+
+    <div class="modal-footer">
+      <span id="storage-modal-status" style="font-size:12px; color:var(--muted);"></span>
+      <button onclick="closeStorageModal()">Close</button>
+    </div>
+  </div>
+</div>
+
 <main>
   <!-- Library Status -->
   <section>
-    <div class="sec-head"><h2>Verified Library</h2><span id="lib-status" class="badge ok">local</span></div>
+    <div class="sec-head">
+      <h2>Verified Library</h2>
+      <div style="display:flex; gap:6px; align-items:center;">
+        <span id="lib-status" class="badge ok">local</span>
+        <button class="btn-sm" onclick="openStorageModal('library')" title="Change library folder">Folder…</button>
+      </div>
+    </div>
     <div id="library">Loading…</div>
   </section>
 
@@ -1093,7 +1494,13 @@ input[type="checkbox"] { cursor: pointer; }
 
   <!-- Target MicroSD Device -->
   <section>
-    <div class="sec-head"><h2>Target MicroSD Card</h2><span id="card-badge" class="badge">detecting</span></div>
+    <div class="sec-head">
+      <h2>Target MicroSD Card</h2>
+      <div style="display:flex; gap:6px; align-items:center;">
+        <span id="card-badge" class="badge">detecting</span>
+        <button class="btn-sm" onclick="openStorageModal('sync')" title="Select or change sync destination">Change…</button>
+      </div>
+    </div>
     <div id="devices">Loading…</div>
   </section>
 
@@ -2813,6 +3220,250 @@ async function rejectCandidate(id) {
     showToast("Error: " + err.message, true);
   } finally {
     refreshAll();
+  }
+}
+
+// ------------------------------------------------------------- Storage & Folders
+let currentStorageTab = 'sync';
+let currentBrowserPath = '';
+let currentBrowserParent = '';
+
+function openStorageModal(tab = 'sync') {
+  const modal = document.getElementById('modal-storage');
+  if (!modal) return;
+  modal.style.display = 'flex';
+  switchStorageTab(tab);
+  loadStorageOverview();
+  browseFolder(currentBrowserPath || '');
+}
+
+function closeStorageModal() {
+  const modal = document.getElementById('modal-storage');
+  if (modal) modal.style.display = 'none';
+}
+
+function switchStorageTab(tab) {
+  currentStorageTab = tab;
+  ['sync', 'library', 'import'].forEach(t => {
+    const btn = document.getElementById('modal-tab-' + t);
+    const view = document.getElementById('storage-view-' + t);
+    if (btn) btn.classList.toggle('active', t === tab);
+    if (view) view.style.display = (t === tab) ? 'block' : 'none';
+  });
+}
+
+async function loadStorageOverview() {
+  try {
+    const statusData = await safeFetch('/api/status');
+    const devData = await safeFetch('/api/devices');
+
+    if (statusData && statusData.storage) {
+      document.getElementById('lib-current-val').textContent = statusData.storage.library_root || 'Not configured';
+      document.getElementById('lib-custom-input').value = statusData.storage.library_root || '';
+      const syncTarget = statusData.storage.target_mount_point || (devData && devData.volumes && devData.volumes[0] ? devData.volumes[0].mount_point : 'Auto-detected / Not set');
+      document.getElementById('sync-current-val').textContent = syncTarget;
+      document.getElementById('sync-custom-input').value = statusData.storage.target_mount_point || (devData && devData.volumes && devData.volumes[0] ? devData.volumes[0].mount_point : '');
+    }
+
+    // Render detected volumes
+    const volBox = document.getElementById('sync-detected-volumes');
+    if (volBox && devData) {
+      const vols = devData.volumes || [];
+      if (!vols.length) {
+        volBox.innerHTML = '<div style="color:var(--muted); font-size:12px; padding:4px 0;">No external cards or USB drives detected. You can set any custom path below.</div>';
+      } else {
+        volBox.innerHTML = vols.map(v => `
+          <div class="volume-item ${v.confirmed ? 'active' : ''}" onclick="applyDetectedVolume('${escapeHtml(v.mount_point)}')">
+            <div>
+              <div style="font-weight:600; color:#fff;">${escapeHtml(v.volume_name || 'Volume')} <span style="font-size:11px; color:var(--muted);">(${v.capacity_gb} GB • ${v.filesystem})</span></div>
+              <div style="font-family:ui-monospace,monospace; font-size:11px; color:var(--accent);">${escapeHtml(v.mount_point)}</div>
+            </div>
+            <button class="btn-sm ${v.confirmed ? 'primary' : ''}">Select</button>
+          </div>
+        `).join('');
+      }
+    }
+  } catch (err) {
+    console.error('Failed to load storage overview', err);
+  }
+}
+
+async function browseFolder(path) {
+  try {
+    const res = await fetch(`/api/system/folders?path=${encodeURIComponent(path || '')}`);
+    const data = await res.json();
+    currentBrowserPath = data.current_path;
+    currentBrowserParent = data.parent_path;
+
+    const pathDisp = document.getElementById('browser-current-path');
+    if (pathDisp) pathDisp.textContent = data.current_path;
+
+    const btnUp = document.getElementById('btn-folder-up');
+    if (btnUp) btnUp.disabled = !data.parent_path;
+
+    // Quick paths
+    const quickBox = document.getElementById('quick-paths-list');
+    if (quickBox && data.quick_paths) {
+      quickBox.innerHTML = data.quick_paths.map(q => `
+        <span class="quick-chip" onclick="browseFolder('${escapeHtml(q.path)}')">${escapeHtml(q.label)}</span>
+      `).join('');
+    }
+
+    // Subdirectories
+    const subBox = document.getElementById('subfolders-list');
+    if (subBox) {
+      const subs = data.subdirectories || [];
+      if (!subs.length) {
+        subBox.innerHTML = '<span style="color:var(--muted); font-size:11.5px; padding:4px;">No visible subfolders</span>';
+      } else {
+        subBox.innerHTML = subs.map(s => `
+          <div class="folder-chip" onclick="browseFolder('${escapeHtml(s.path)}')" title="${escapeHtml(s.path)}">
+            📁 ${escapeHtml(s.name)}
+          </div>
+        `).join('');
+      }
+    }
+
+    // If import tab is active, update input automatically
+    if (currentStorageTab === 'import') {
+      const impInp = document.getElementById('import-folder-input');
+      if (impInp && !impInp.value) impInp.value = data.current_path;
+    }
+  } catch (err) {
+    console.error('Browse folder error:', err);
+  }
+}
+
+function navigateFolderUp() {
+  if (currentBrowserParent) {
+    browseFolder(currentBrowserParent);
+  }
+}
+
+function selectCurrentBrowserFolder() {
+  if (currentStorageTab === 'sync') {
+    document.getElementById('sync-custom-input').value = currentBrowserPath;
+    applyCustomSyncFolder();
+  } else if (currentStorageTab === 'library') {
+    document.getElementById('lib-custom-input').value = currentBrowserPath;
+    applyCustomLibraryFolder();
+  } else if (currentStorageTab === 'import') {
+    document.getElementById('import-folder-input').value = currentBrowserPath;
+    scanSelectedImportFolder();
+  }
+}
+
+async function applyCustomSyncFolder() {
+  const path = document.getElementById('sync-custom-input').value.trim();
+  if (!path) return;
+  showToast(`Setting target sync folder to ${path}…`);
+  try {
+    const res = await fetch(`/api/settings/target-device?mount_point=${encodeURIComponent(path)}&confirm=true`, { method: 'POST' });
+    const data = await res.json();
+    if (data.ok) {
+      showToast(`✓ Sync target set to: ${data.mount_point}`);
+      loadStorageOverview();
+      refreshAll();
+    } else {
+      showToast('Error: ' + data.error, true);
+    }
+  } catch (err) {
+    showToast('Failed to set target: ' + err.message, true);
+  }
+}
+
+async function applyDetectedVolume(mountPoint) {
+  document.getElementById('sync-custom-input').value = mountPoint;
+  applyCustomSyncFolder();
+}
+
+async function applyCustomLibraryFolder() {
+  const path = document.getElementById('lib-custom-input').value.trim();
+  if (!path) return;
+  if (!confirm(`Change music library directory to:\n${path}\n\nExisting files in the current library won't be deleted.`)) return;
+  showToast(`Updating library storage location…`);
+  try {
+    const res = await fetch(`/api/settings/library-root?path=${encodeURIComponent(path)}`, { method: 'POST' });
+    const data = await res.json();
+    if (data.ok) {
+      showToast(`✓ Library directory updated to: ${data.library_root}`);
+      loadStorageOverview();
+      refreshAll();
+    } else {
+      showToast('Error: ' + data.error, true);
+    }
+  } catch (err) {
+    showToast('Failed to update library root: ' + err.message, true);
+  }
+}
+
+async function scanSelectedImportFolder() {
+  const input = document.getElementById('import-folder-input');
+  const path = input.value.trim() || currentBrowserPath;
+  if (!path) return;
+  input.value = path;
+  const box = document.getElementById('import-preview-box');
+  const stats = document.getElementById('import-preview-stats');
+  const samples = document.getElementById('import-preview-samples');
+
+  box.style.display = 'block';
+  stats.innerHTML = `<span style="color:var(--muted);">Scanning ${escapeHtml(path)} for audio files…</span>`;
+  samples.innerHTML = '';
+
+  try {
+    const res = await fetch(`/api/folder/scan?path=${encodeURIComponent(path)}`);
+    const data = await res.json();
+    if (data.ok && data.summary) {
+      const s = data.summary;
+      const exts = Object.entries(s.extensions || {}).map(([k, v]) => `${k.toUpperCase()}: ${v}`).join(', ');
+      stats.innerHTML = `Found <span style="color:var(--good);">${s.total_files} audio files</span> (${s.total_mb} MB) ${exts ? `• [${exts}]` : ''}`;
+      if (s.sample_tracks && s.sample_tracks.length) {
+        samples.innerHTML = s.sample_tracks.map(t => `
+          <div style="padding:2px 0;">• <span style="color:#fff;">${escapeHtml(t.title)}</span> <span style="color:var(--muted);">by ${escapeHtml(t.artist)} (${escapeHtml(t.album)})</span></div>
+        `).join('');
+      } else {
+        samples.innerHTML = '<span style="color:var(--muted);">No audio files found in this folder.</span>';
+      }
+    } else {
+      stats.innerHTML = `<span style="color:var(--bad);">Scan failed: ${escapeHtml(data.error || 'Unknown error')}</span>`;
+    }
+  } catch (err) {
+    stats.innerHTML = `<span style="color:var(--bad);">Error scanning folder: ${escapeHtml(err.message)}</span>`;
+  }
+}
+
+async function executeFolderImport() {
+  const input = document.getElementById('import-folder-input');
+  const path = input.value.trim() || currentBrowserPath;
+  if (!path) {
+    showToast('Please select a folder to import', true);
+    return;
+  }
+  const btn = document.getElementById('btn-run-import');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Importing…';
+  }
+  showToast(`Starting folder import from ${path}… (check Live Activity monitor)`);
+  pollActivity();
+
+  try {
+    const res = await fetch(`/api/actions/import-folder?folder_path=${encodeURIComponent(path)}&copy_files=true`, { method: 'POST' });
+    const data = await res.json();
+    if (data.ok) {
+      showToast(`✓ Import complete: ${data.imported} tracks imported into library (${data.skipped} skipped)`);
+      refreshAll();
+    } else {
+      showToast('Import error: ' + (data.error || 'failed'), true);
+    }
+  } catch (err) {
+    showToast('Import request error: ' + err.message, true);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '📥 Import into Library';
+    }
+    pollActivity();
   }
 }
 

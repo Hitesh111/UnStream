@@ -102,7 +102,8 @@ class LibraryConfig(BaseModel):
 class DeviceConfig(BaseModel):
     expected_player: str = "SNOWSKY Echo Mini"
     expected_card_capacity_gb: int = 64
-    filesystem_whitelist: list[str] = Field(default_factory=lambda: ["exfat", "msdos", "fat32"])
+    filesystem_whitelist: list[str] = Field(default_factory=lambda: ["exfat", "msdos", "fat32", "custom"])
+    mount_point: str | None = None
     auto_detect: bool = True
     auto_sync: bool = False
     dry_run_by_default: bool = True

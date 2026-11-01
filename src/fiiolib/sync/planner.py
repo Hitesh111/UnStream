@@ -139,7 +139,8 @@ class SyncPlanner:
 
     def is_confirmed(self, volume: VolumeInfo) -> bool:
         row = self.db.one(
-            "SELECT confirmed FROM devices WHERE identifier = ?", (device_identifier(volume),)
+            "SELECT confirmed FROM devices WHERE identifier = ? OR mount_point = ?",
+            (device_identifier(volume), volume.mount_point),
         )
         return bool(row and row["confirmed"])
 

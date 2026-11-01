@@ -102,6 +102,34 @@ def test_dashboard_endpoints(config: Config, db: Database) -> None:
     assert exp_disc.status_code == 200
     assert "results" in exp_disc.json()
 
+    # System folder browser endpoint
+    sys_f = client.get("/api/system/folders", headers=headers)
+    assert sys_f.status_code == 200
+    assert "current_path" in sys_f.json()
+    assert "subdirectories" in sys_f.json()
+    assert "quick_paths" in sys_f.json()
+
+    # Folder scan preview endpoint
+    scan_res = client.get(f"/api/folder/scan?path={config.root}", headers=headers)
+    assert scan_res.status_code == 200
+    assert scan_res.json()["ok"] is True
+    assert "total_files" in scan_res.json()["summary"]
+
+    # Target sync folder setting
+    set_tgt = client.post(f"/api/settings/target-device?mount_point={config.root}", headers=headers)
+    assert set_tgt.status_code == 200
+    assert set_tgt.json()["ok"] is True
+
+    # Library root setting
+    set_lib = client.post(f"/api/settings/library-root?path={config.root}", headers=headers)
+    assert set_lib.status_code == 200
+    assert set_lib.json()["ok"] is True
+
+    # Import folder endpoint (empty/dry directory)
+    imp_res = client.post(f"/api/actions/import-folder?folder_path={config.root}", headers=headers)
+    assert imp_res.status_code == 200
+    assert imp_res.json()["ok"] is True
+
     blocked = client.get("/api/health", headers={"host": "evil.example"})
     assert blocked.status_code == 403
 
